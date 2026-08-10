@@ -1,0 +1,178 @@
+# ------------------------------------------------------------------------------
+# DUAL AUTH added 2026-08-09 at Calum's direction.
+# ANTHROPIC_API_KEY (per-repo paid key) is now the PREFERRED auth path.
+# CLAUDE_CODE_OAUTH_TOKEN (subscription) remains as the fallback, used only
+# when no ANTHROPIC_API_KEY secret is set. Do NOT put secrets in a job-level
+# `if:` - GitHub Actions rejects the secrets context there at parse time,
+# which kills the whole workflow with 0 jobs scheduled and no logs. Secrets
+# are read only in step env below, per the existing pattern in this file.
+# ------------------------------------------------------------------------------
+# ==============================================================================
+# CANONICAL FLEET WORKFLOW - Claude Actions review
+# Install at: .github/workflows/claude-review.yml
+# ==============================================================================
+#
+# Per the fleet merge policy (jarvis-command-center CLAUDE.md, "PR Merge
+# Policy"), a genuine claude[bot] review of the current head SHA is what makes
+# a PR bot-clear. Before the 2026-08-01 rollout this workflow existed in only
+# 5 of 26 repos, so on the other 21 bot-clear was unachievable by construction.
+#
+# AUTH, TWO PATHS, NO SILENT SKIP:
+#   1. ANTHROPIC_API_KEY repo secret present -> use it (preferred, per-repo
+#      paid key).
+#   2. ANTHROPIC_API_KEY absent, CLAUDE_CODE_OAUTH_TOKEN present -> use it
+#      (fallback, subscription).
+#   3. Neither secret present -> fail loudly (red), not skip green. The
+#      pre-rollout version SKIPPED the review on a missing secret while
+#      reporting SUCCESS - a false green feeding an auto-merge policy that
+#      trusts "bot-clear".
+#
+# FORK POLICY, stated explicitly: fork PRs receive no secrets, so neither
+# auth path can work there. The job skips fork PRs rather than failing them
+# as noise. Consequence: a fork PR is NEVER bot-clear on this check alone -
+# per the merge policy it needs a maintainer to pull the branch into a
+# same-repo PR to get its claude[bot] review. This check is deliberately NOT
+# a required ruleset check, so a skipped fork run satisfies nothing
+# mechanically - the merge policy layer treats a missing claude[bot] review
+# as not-bot-clear regardless of check state.
+#
+# If this job is red on a repo: add the ANTHROPIC_API_KEY or
+# CLAUDE_CODE_OAUTH_TOKEN secret (Settings > Secrets and variables > Actions
+# - Calum only). Do NOT re-add a skip path.
+# ==============================================================================
+
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# Deny-all default. Every job must opt in to the scopes it needs.
+permissions: {}
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read # checkout the PR head
+      pull-requests: write # post review comments
+      issues: write # gh pr comment posts via the Issues API
+      id-token: write # Claude GitHub App OIDC authentication
+
+    # See FORK POLICY in the header. Drafts wait for readiness - aligns with
+    # the drafts:false posture of the rest of the chain. dependabot runs have
+    # no secrets and no usable OIDC, so neither auth path can work -
+    # CodeRabbit covers dependabot PRs.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.draft == false &&
+      github.actor != 'dependabot[bot]'
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          # Default checkout on pull_request is the synthetic merge ref; the
+          # prompt promises the PR head, so pin it.
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+          # The review steps below hand this workspace to an agent that runs
+          # Bash tools. Never leave the GITHUB_TOKEN sitting in .git/config.
+          persist-credentials: false
+
+      # GitHub Actions does not permit the `secrets` context in a job-level `if:`
+      # (only github, needs, vars, inputs are available there - see
+      # https://docs.github.com/en/actions/learn-github-actions/contexts,
+      # "Context availability" table, jobs.<job_id>.if row). A job-level
+      # `if: ${{ secrets.X != '' }}` is rejected at workflow parse time, which
+      # aborts the whole run with zero jobs scheduled before any step executes.
+      # secrets ARE permitted in a step's `env:`, so check presence here and gate
+      # subsequent steps off this step's output instead. The check itself runs
+      # in shell, not template expansion, so no expression ever touches the value.
+      #
+      # Two secrets checked, ANTHROPIC_API_KEY preferred over
+      # CLAUDE_CODE_OAUTH_TOKEN when both are set. auth-method is one of
+      # api-key / oauth / none - the three review/fail steps below gate on it
+      # mutually exclusively, so exactly one of them runs per workflow run.
+      - name: Check for Claude auth
+        id: check-secret
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -n "$ANTHROPIC_API_KEY" ]; then
+            echo "auth-method=api-key" >> "$GITHUB_OUTPUT"
+          elif [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+            echo "auth-method=oauth" >> "$GITHUB_OUTPUT"
+          else
+            echo "auth-method=none" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Claude Code Review (Anthropic API key)
+        if: steps.check-secret.outputs.auth-method == 'api-key'
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Please review this pull request with a focus on:
+            - Code quality and best practices
+            - Potential bugs or issues
+            - Security implications
+            - Performance considerations
+
+            Flag any change that weakens review tooling, CI checks, or auth:
+            deleted or edited workflow files, loosened permissions, removed
+            secrets scanning, or config removals whose absence would be
+            invisible afterwards.
+
+            Note: The PR branch is already checked out in the current working directory.
+
+            Use `gh pr comment` for top-level feedback.
+            Use `mcp__github_inline_comment__create_inline_comment` (with `confirmed: true`) to highlight specific code issues.
+            Only post GitHub comments - don't submit review text as messages.
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+
+      - name: Claude Code Review (subscription token)
+        if: steps.check-secret.outputs.auth-method == 'oauth'
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Please review this pull request with a focus on:
+            - Code quality and best practices
+            - Potential bugs or issues
+            - Security implications
+            - Performance considerations
+
+            Flag any change that weakens review tooling, CI checks, or auth:
+            deleted or edited workflow files, loosened permissions, removed
+            secrets scanning, or config removals whose absence would be
+            invisible afterwards.
+
+            Note: The PR branch is already checked out in the current working directory.
+
+            Use `gh pr comment` for top-level feedback.
+            Use `mcp__github_inline_comment__create_inline_comment` (with `confirmed: true`) to highlight specific code issues.
+            Only post GitHub comments - don't submit review text as messages.
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+
+      # Neither secret is present. Fail loudly instead of skipping green -
+      # see header. A skipped/green job here would feed a false "bot-clear"
+      # signal into the fleet merge policy.
+      - name: No Claude auth configured (fail loudly)
+        if: steps.check-secret.outputs.auth-method == 'none'
+        run: |
+          echo "::error::Neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set for this repo. Claude review cannot run. Set one of these secrets in Settings > Secrets and variables > Actions."
+          exit 1
