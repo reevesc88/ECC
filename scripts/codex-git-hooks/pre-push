@@ -3,6 +3,43 @@ set -euo pipefail
 
 # ECC Codex Git Hook: pre-push
 # Runs a lightweight verification flow before pushes.
+#
+# Robustness notes (2026-08):
+#   - Every checked command (lint/typecheck/test/build/audit/go test/pytest)
+#     runs under a bounded wall-clock timeout so a single hung process can
+#     never block a push forever. Each check gets its OWN full budget
+#     (ECC_PREPUSH_TIMEOUT, default 600s) rather than sharing one clock, so
+#     a legitimately slow step (a large monorepo's test suite can easily
+#     need several minutes) never starves a later, healthy step of time.
+#     The dependency audit gets its own separate budget
+#     (ECC_PREPUSH_AUDIT_TIMEOUT, default = ECC_PREPUSH_TIMEOUT) since a
+#     silent/unresponsive registry proxy is a different failure shape than
+#     a genuinely stuck build.
+#   - This hook fails CLOSED on timeout: a check that times out blocks the
+#     push, it does not skip through silently. Pushes happen far less often
+#     than commits, and a hang during lint/build/test is frequently itself
+#     evidence of a real defect in the code being pushed, so the cost of an
+#     occasional false-positive block (rerun, or raise the timeout) is worth
+#     paying rather than pushing exactly the code most likely to be broken
+#     with zero signal. ECC_SKIP_PREPUSH=1 remains the deliberate escape
+#     hatch for a push that genuinely needs to bypass this hook.
+#   - Missing tooling (node/go/pytest/the detected package manager) or an
+#     unparseable package.json is a clean fail(), never a silent no-op --
+#     silently skipping every check here would mean a push leaves lint/
+#     typecheck/test/build completely unverified with nothing in the log
+#     to say so.
+#   - Known residual limitation: on Windows, `timeout` sends SIGTERM (then
+#     SIGKILL after a grace period) to the direct child process it spawned.
+#     npm/pnpm/yarn/bun run through .cmd wrapper scripts that themselves
+#     spawn further child processes; a deeply nested grandchild (e.g. a
+#     test runner that forks its own workers) is not guaranteed to be
+#     reaped in every case. This is a known class of limitation for
+#     process-tree kills under MSYS/Git-for-Windows and is not fully
+#     closed by this script.
+#   - Second known limitation: if the `timeout` binary itself is missing
+#     from PATH, checks fall back to running unbounded (a loud warning is
+#     logged when this happens). Confirmed present on the reference
+#     deployment machine (Git for Windows ships GNU coreutils timeout).
 
 if [[ "${ECC_SKIP_GIT_HOOKS:-0}" == "1" || "${ECC_SKIP_PREPUSH:-0}" == "1" ]]; then
   exit 0
@@ -30,7 +67,12 @@ if [[ "$is_delete_only" == "true" ]]; then
   exit 0
 fi
 
-ran_any_check=0
+# The loop above may break before every ref-update line is read (e.g. a push
+# that updates one ref and deletes another in the same invocation). Sever
+# this process's stdin from the original pipe now, before any external tool
+# runs, so a leftover buffered ref line can never leak into a child
+# process's stdin -- npm/pnpm/yarn/bun/go/pytest all inherit fd 0 otherwise.
+exec </dev/null
 
 log() {
   printf '[ECC pre-push] %s\n' "$*"
@@ -38,9 +80,68 @@ log() {
 
 fail() {
   printf '[ECC pre-push] FAILED: %s\n' "$*" >&2
+  printf '[ECC pre-push] Temporary bypass: ECC_SKIP_PREPUSH=1 git push ...\n' >&2
   exit 1
 }
 
+# ---------------------------------------------------------------------------
+# Timeout budgets
+# ---------------------------------------------------------------------------
+# ECC_PREPUSH_TIMEOUT bounds each lint/typecheck/test/build/go-test/pytest
+# invocation (default 600s / 10 minutes -- generous enough for a real check
+# on a mid-to-large repo; the point is to catch a genuinely stuck process,
+# not to race a slow-but-healthy one). ECC_PREPUSH_AUDIT_TIMEOUT bounds the
+# separate, opt-in dependency audit and defaults to the same value but can
+# be tuned independently.
+TIMEOUT_SECS="${ECC_PREPUSH_TIMEOUT:-600}"
+AUDIT_TIMEOUT_SECS="${ECC_PREPUSH_AUDIT_TIMEOUT:-$TIMEOUT_SECS}"
+
+for _tv_name in TIMEOUT_SECS AUDIT_TIMEOUT_SECS; do
+  _tv_val="${!_tv_name}"
+  if ! [[ "$_tv_val" =~ ^[0-9]+$ ]] || [[ "$_tv_val" -eq 0 ]]; then
+    fail "ECC_PREPUSH_TIMEOUT / ECC_PREPUSH_AUDIT_TIMEOUT must be a positive integer number of seconds (got: '$_tv_val')"
+  fi
+done
+unset _tv_name _tv_val
+
+HAVE_TIMEOUT=0
+if command -v timeout >/dev/null 2>&1; then
+  HAVE_TIMEOUT=1
+else
+  log "WARNING: 'timeout' not found on PATH -- checks below will run WITHOUT a time bound."
+fi
+
+# run_checked <timeout_seconds> <description> <command...>
+# Runs a command under the given wall-clock timeout (when 'timeout' is
+# available) with stdin from /dev/null (belt-and-braces on top of the
+# `exec </dev/null` above). fail()s with a distinct, actionable message on
+# timeout (exit 124, or 137 if SIGKILL was needed) vs. an ordinary nonzero
+# exit. -k 10 sends SIGKILL 10s after the initial SIGTERM if the process
+# ignores it.
+run_checked() {
+  local timeout_secs="$1"
+  local desc="$2"
+  shift 2
+  local rc=0
+  if [[ "$HAVE_TIMEOUT" -eq 1 ]]; then
+    timeout -k 10 "${timeout_secs}" "$@" </dev/null || rc=$?
+  else
+    "$@" </dev/null || rc=$?
+  fi
+  if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
+    fail "$desc timed out after ${timeout_secs}s (raise it with ECC_PREPUSH_TIMEOUT=<seconds>, or ECC_PREPUSH_AUDIT_TIMEOUT=<seconds> for the audit step, if this is a legitimately slow check)"
+  elif [[ "$rc" -ne 0 ]]; then
+    fail "$desc failed"
+  fi
+}
+
+# Lockfile precedence (highest to lowest): pnpm-lock.yaml > bun.lockb >
+# yarn.lock > package-lock.json > npm (no lockfile). This mirrors the
+# typical adoption order of faster tooling and keeps detection
+# deterministic when a repo is mid-migration between package managers.
+# When more than one lockfile is present, only the highest-precedence one
+# is used -- warn_multiple_lockfiles below makes that choice visible
+# instead of silent.
 detect_pm() {
   if [[ -f "pnpm-lock.yaml" ]]; then
     echo "pnpm"
@@ -55,61 +156,123 @@ detect_pm() {
   fi
 }
 
-has_node_script() {
-  local script_name="$1"
-  node -e 'const fs=require("fs"); const p=JSON.parse(fs.readFileSync("package.json","utf8")); process.exit(p.scripts && p.scripts[process.argv[1]] ? 0 : 1)' "$script_name" >/dev/null 2>&1
+warn_multiple_lockfiles() {
+  local chosen="$1"
+  local found=()
+  [[ -f "pnpm-lock.yaml" ]] && found+=("pnpm-lock.yaml")
+  [[ -f "bun.lockb" ]] && found+=("bun.lockb")
+  [[ -f "yarn.lock" ]] && found+=("yarn.lock")
+  [[ -f "package-lock.json" ]] && found+=("package-lock.json")
+  if [[ "${#found[@]}" -gt 1 ]]; then
+    log "WARNING: multiple lockfiles detected (${found[*]}); using '$chosen' per precedence order (see detect_pm in this hook)."
+  fi
 }
 
-run_node_script() {
-  local pm="$1"
-  local script_name="$2"
-  case "$pm" in
-    pnpm) pnpm run "$script_name" ;;
-    bun) bun run "$script_name" ;;
-    yarn) yarn "$script_name" ;;
-    npm) npm run "$script_name" ;;
-    *) npm run "$script_name" ;;
-  esac
+# node_script_status <script_name>
+# Exit code conveys three distinct states, not two:
+#   0 = script is defined in package.json
+#   1 = script is absent (package.json parsed fine, key just isn't set)
+#   2 = could not determine -- package.json failed to parse as JSON
+# Callers MUST branch on all three; collapsing 1 and 2 together is what
+# previously let a corrupt package.json look identical to "no script
+# configured" and silently skip every check.
+node_script_status() {
+  local script_name="$1"
+  node -e '
+    const fs = require("fs");
+    let pkg;
+    try {
+      pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+    } catch (e) {
+      process.exit(2);
+    }
+    process.exit(pkg.scripts && pkg.scripts[process.argv[1]] ? 0 : 1);
+  ' "$script_name" >/dev/null 2>&1
 }
+
+ran_any_check=0
 
 if [[ -f "package.json" ]]; then
+  # node is required to even inspect package.json's scripts, and
+  # package.json's presence signals a real Node project -- silently
+  # skipping every check here (as the original script did when node was
+  # missing) would mean pushes leave lint/typecheck/test/build unverified
+  # with nothing in the log to say so. Fail clearly instead;
+  # ECC_SKIP_PREPUSH remains the intentional bypass.
+  if ! command -v node >/dev/null 2>&1; then
+    fail "package.json found but 'node' is not on PATH -- cannot determine or run Node.js checks (lint/typecheck/test/build)"
+  fi
+
+  # Confirm package.json actually parses before trusting any per-script
+  # lookup below. A malformed package.json (mid-merge-conflict markers,
+  # a bad rebase, etc.) must not be indistinguishable from "no scripts
+  # defined" -- see node_script_status's exit-code contract above.
+  probe_rc=0
+  node_script_status "__ecc_prepush_probe__" || probe_rc=$?
+  if [[ "$probe_rc" -eq 2 ]]; then
+    fail "package.json is not valid JSON -- cannot determine which pre-push checks to run"
+  fi
+
   pm="$(detect_pm)"
+  warn_multiple_lockfiles "$pm"
+
+  if ! command -v "$pm" >/dev/null 2>&1; then
+    fail "$pm not found on PATH (required to run Node.js checks; selected via lockfile -- see detect_pm in this hook)"
+  fi
+
   log "Node project detected (package manager: $pm)"
 
   for script_name in lint typecheck test build; do
-    if has_node_script "$script_name"; then
+    rc=0
+    node_script_status "$script_name" || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
       ran_any_check=1
-      log "Running: $script_name"
-      run_node_script "$pm" "$script_name" || fail "$script_name failed"
-    else
+      log "Running: $script_name (timeout ${TIMEOUT_SECS}s)"
+      # run_checked ultimately execs its command via 'timeout', which
+      # cannot invoke a bash function -- pass the real package-manager
+      # executable and its args directly, inlined per-pm.
+      case "$pm" in
+        pnpm) run_checked "$TIMEOUT_SECS" "$script_name" pnpm run "$script_name" ;;
+        bun) run_checked "$TIMEOUT_SECS" "$script_name" bun run "$script_name" ;;
+        yarn) run_checked "$TIMEOUT_SECS" "$script_name" yarn "$script_name" ;;
+        npm) run_checked "$TIMEOUT_SECS" "$script_name" npm run "$script_name" ;;
+        *) run_checked "$TIMEOUT_SECS" "$script_name" npm run "$script_name" ;;
+      esac
+    elif [[ "$rc" -eq 1 ]]; then
       log "Skipping missing script: $script_name"
+    else
+      fail "Could not determine whether npm script '$script_name' is defined (package.json parse error)"
     fi
   done
 
   if [[ "${ECC_PREPUSH_AUDIT:-0}" == "1" ]]; then
     ran_any_check=1
-    log "Running dependency audit (ECC_PREPUSH_AUDIT=1)"
+    log "Running dependency audit (ECC_PREPUSH_AUDIT=1, timeout ${AUDIT_TIMEOUT_SECS}s)"
     case "$pm" in
-      pnpm) pnpm audit --prod || fail "pnpm audit failed" ;;
-      bun) bun audit || fail "bun audit failed" ;;
-      yarn) yarn npm audit --recursive || fail "yarn audit failed" ;;
-      npm) npm audit --omit=dev || fail "npm audit failed" ;;
-      *) npm audit --omit=dev || fail "npm audit failed" ;;
+      pnpm) run_checked "$AUDIT_TIMEOUT_SECS" "pnpm audit" pnpm audit --prod ;;
+      bun) run_checked "$AUDIT_TIMEOUT_SECS" "bun audit" bun audit ;;
+      yarn) run_checked "$AUDIT_TIMEOUT_SECS" "yarn audit" yarn npm audit --recursive ;;
+      npm) run_checked "$AUDIT_TIMEOUT_SECS" "npm audit" npm audit --omit=dev ;;
+      *) run_checked "$AUDIT_TIMEOUT_SECS" "npm audit" npm audit --omit=dev ;;
     esac
   fi
 fi
 
-if [[ -f "go.mod" ]] && command -v go >/dev/null 2>&1; then
-  ran_any_check=1
-  log "Go project detected. Running: go test ./..."
-  go test ./... || fail "go test failed"
+if [[ -f "go.mod" ]]; then
+  if command -v go >/dev/null 2>&1; then
+    ran_any_check=1
+    log "Go project detected. Running: go test ./... (timeout ${TIMEOUT_SECS}s)"
+    run_checked "$TIMEOUT_SECS" "go test" go test ./...
+  else
+    log "Go project detected (go.mod found) but 'go' is not on PATH. Skipping."
+  fi
 fi
 
 if [[ -f "pyproject.toml" || -f "requirements.txt" ]]; then
   if command -v pytest >/dev/null 2>&1; then
     ran_any_check=1
-    log "Python project detected. Running: pytest -q"
-    pytest -q || fail "pytest failed"
+    log "Python project detected. Running: pytest -q (timeout ${TIMEOUT_SECS}s)"
+    run_checked "$TIMEOUT_SECS" "pytest" pytest -q
   else
     log "Python project detected but pytest is not installed. Skipping."
   fi
