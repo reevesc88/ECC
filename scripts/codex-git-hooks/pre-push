@@ -128,8 +128,15 @@ run_checked() {
   else
     "$@" </dev/null || rc=$?
   fi
-  if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
+  if [[ "$rc" -eq 124 ]]; then
     fail "$desc timed out after ${timeout_secs}s (raise it with ECC_PREPUSH_TIMEOUT=<seconds>, or ECC_PREPUSH_AUDIT_TIMEOUT=<seconds> for the audit step, if this is a legitimately slow check)"
+  elif [[ "$rc" -eq 137 ]]; then
+    # 137 (128+SIGKILL) is ambiguous, unlike 124: GNU `timeout` itself
+    # documents that 137 can mean either this hook's own `timeout -k 10`
+    # escalated to SIGKILL after the process ignored SIGTERM, OR that
+    # something external (most commonly the OOM killer) sent SIGKILL on its
+    # own, independent of this timeout. Don't assert "timed out" as fact.
+    fail "$desc timed out or killed (OOM) after up to ${timeout_secs}s (exit 137/SIGKILL is ambiguous -- it can be this hook's own timeout escalating past SIGTERM, or an external kill such as an OOM killer; if this is a legitimately slow check, raise it with ECC_PREPUSH_TIMEOUT=<seconds>, or ECC_PREPUSH_AUDIT_TIMEOUT=<seconds> for the audit step -- otherwise investigate memory usage)"
   elif [[ "$rc" -ne 0 ]]; then
     fail "$desc failed"
   fi
@@ -158,13 +165,33 @@ detect_pm() {
 
 warn_multiple_lockfiles() {
   local chosen="$1"
-  local found=()
-  [[ -f "pnpm-lock.yaml" ]] && found+=("pnpm-lock.yaml")
-  [[ -f "bun.lockb" ]] && found+=("bun.lockb")
-  [[ -f "yarn.lock" ]] && found+=("yarn.lock")
-  [[ -f "package-lock.json" ]] && found+=("package-lock.json")
-  if [[ "${#found[@]}" -gt 1 ]]; then
-    log "WARNING: multiple lockfiles detected (${found[*]}); using '$chosen' per precedence order (see detect_pm in this hook)."
+  # Bash 3.2 (the system bash on supported macOS, see README.md:1367-1372)
+  # treats an initialized-but-empty array as unset under `set -u`: expanding
+  # `${found[@]}` (or even `${#found[@]}`) when found=() aborts with
+  # "found: unbound variable" before any checks run -- a Node repo with none
+  # of the recognized lockfiles hits exactly that path. Track a scalar count
+  # plus a plain string instead of an array, so there is nothing here for
+  # nounset to trip on regardless of bash version.
+  local found_count=0
+  local found_list=""
+  if [[ -f "pnpm-lock.yaml" ]]; then
+    found_count=$((found_count + 1))
+    found_list+="pnpm-lock.yaml "
+  fi
+  if [[ -f "bun.lockb" ]]; then
+    found_count=$((found_count + 1))
+    found_list+="bun.lockb "
+  fi
+  if [[ -f "yarn.lock" ]]; then
+    found_count=$((found_count + 1))
+    found_list+="yarn.lock "
+  fi
+  if [[ -f "package-lock.json" ]]; then
+    found_count=$((found_count + 1))
+    found_list+="package-lock.json "
+  fi
+  if [[ "$found_count" -gt 1 ]]; then
+    log "WARNING: multiple lockfiles detected (${found_list% }); using '$chosen' per precedence order (see detect_pm in this hook)."
   fi
 }
 
