@@ -57,6 +57,14 @@ concurrency:
 jobs:
   claude-review:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # Scrubs the Claude auth token from the Claude subprocess Bash environment
+    # so a prompt-injected instruction in a PR cannot exfiltrate it via a
+    # Bash tool call the subprocess runs. See anthropics/claude-code-action
+    # action.yml and docs/security.md for CLAUDE_CODE_SUBPROCESS_ENV_SCRUB.
+    env:
+      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
 
     permissions:
       contents: read # checkout the PR head
