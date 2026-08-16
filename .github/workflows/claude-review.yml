@@ -92,6 +92,17 @@ jobs:
           # Bash tools. Never leave the GITHUB_TOKEN sitting in .git/config.
           persist-credentials: false
 
+      # CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 (job env above) makes the Claude
+      # Code install require bubblewrap for subprocess env scrubbing and
+      # isolation. The ubuntu-latest runner image does not ship it, so the
+      # claude-code-action install fails with "bubblewrap is required" without
+      # this step. Install it rather than disabling the scrub - the scrub is a
+      # deliberate security control (see comment on the job env above).
+      - name: Install bubblewrap (required by subprocess env scrub)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+
       # GitHub Actions does not permit the `secrets` context in a job-level `if:`
       # (only github, needs, vars, inputs are available there - see
       # https://docs.github.com/en/actions/learn-github-actions/contexts,
