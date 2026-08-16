@@ -1,36 +1,221 @@
+# ==============================================================================
+# CANONICAL FLEET CodeRabbit CONFIG
+# Canonical path: <repo-root>/.coderabbit.yaml   (NOT .github/coderabbit.yaml)
+# ==============================================================================
+#
+# ONE COPY PER REPO. If .github/coderabbit.yaml also exists, DELETE IT.
+# Two copies of one policy is the drift trap: one gets edited, the other does
+# not, and afterwards nobody can tell which one CodeRabbit actually resolved.
+# Fleet audit found 4 repos with both files and 6 repos with only the .github/
+# copy. CodeRabbit's documented resolution order prefers the repo root, so the
+# .github/ copy is at best dead weight and at worst a false record of policy.
+#
+# ------------------------------------------------------------------------------
+# WHY auto_review IS ON
+# ------------------------------------------------------------------------------
+# CodeRabbit is paid for on an annual plan. A config that sets
+# `auto_review.enabled: false` and then depends on a workflow to attach the bot
+# as a requested reviewer has TWO failure modes stacked on each other:
+#
+#   1. Nobody remembers to add the `ai-review` label, so nothing is reviewed.
+#   2. If the reviewer-request API call fails, there is no second path. The
+#      review simply never happens, and the workflow reports green.
+#
+# Setting `enabled: true` fixes this: CodeRabbit subscribes to the
+# PR events itself and reviews without needing anything to be requested. The
+# coderabbit-trigger.yml workflow is REMOVED fleet-wide (requestReviewers
+# cannot attach the CodeRabbit app; verified live 2026-08-01), so auto_review
+# is the ONLY - and sufficient - CodeRabbit path. A workflow could only ever
+# verify that a request succeeded; the config removes the dependency on the
+# request in the first place.
+#
+# ------------------------------------------------------------------------------
+# WHY THERE ARE NO ignore_title_keywords
+# ------------------------------------------------------------------------------
+# The fleet's previous configs carried ignore_title_keywords: ["WIP", ...].
+# DROPPED DELIBERATELY. Reason:
+#
+#   A skipped review reports SUCCESS. The fleet merge policy auto-merges on
+#   "bot-clear". A PR titled "WIP: fix auth" therefore reports a green
+#   CodeRabbit check having reviewed exactly nothing, and is then eligible for
+#   automatic merge. That is a false-green directly wired to the merge gate.
+#
+# The keyword is also REDUNDANT. Draft status already signals "not ready", it
+# is structural rather than a string anyone can typo, and it is already
+# handled by `drafts: false` below. Quota is managed by `drafts: false` +
+# `auto_incremental_review: false` (one pass on the finished diff, per Gospel
+# Rule 3), not by a title string that turns a skip into a pass.
+#
+# `ignore_usernames` carries NO dependabot/renovate entries, deliberately:
+# dependabot/renovate PRs run Actions with fork-like restrictions (no secrets,
+# read-only token), so the Claude and Copilot workflows deliberately skip
+# them. CodeRabbit reviews via its app rather than repo Actions, so it is the
+# ONLY reviewer that still works there and must not ignore them.
+#
+# ------------------------------------------------------------------------------
+# ECC-SPECIFIC NOTES (this repo only)
+# ------------------------------------------------------------------------------
+# ECC additionally sets review_details, commit_status, fail_commit_status, and
+# high_level_summary_in_walkthrough. These are real documented CodeRabbit keys
+# beyond the fleet baseline: commit_status/fail_commit_status make CodeRabbit
+# post a commit status check that fails on real findings, which this repo's
+# branch protection can gate on alongside the Copilot review ruleset and
+# claude-review workflow. Kept because ECC is a plugin/skills/agents host repo
+# with its own merge-gating setup, not because the fleet baseline was wrong.
+#
+# ECC also carries extra path_instructions for directories that only exist in
+# this repo's own layout (scripts/bin, skills/**/scripts, the
+# skills/commands/agents/rules tree, and SECURITY.md/docs/security). These are
+# additive to the fleet's generic path_instructions below, not a replacement.
+# ==============================================================================
+
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
-language: "en-US"
-early_access: false
-tone_instructions: "Be direct, concise, and evidence-led. Prioritize actionable findings over praise."
+
+language: "en-AU"
+
+tone_instructions: >-
+  Be concise and direct. Skip style nitpicks and subjective preferences.
+  Prioritise: security defects, data-loss risks, and correctness bugs.
+  If you have nothing substantive to say, say so briefly rather than
+  padding the review.
 
 reviews:
+  # "assertive" over "chill": the plan is paid for, and a review that surfaces
+  # nothing is worth nothing. Fleet audit found 3 repos on "chill" and the rest
+  # on "assertive" with no stated reason for the split.
   profile: "assertive"
-  request_changes_workflow: false
+
+  # Blocks merge on genuine findings rather than leaving them as advice.
+  request_changes_workflow: true
+
   high_level_summary: true
   high_level_summary_in_walkthrough: true
   review_status: true
   review_details: true
   commit_status: true
   fail_commit_status: true
+  poem: false
+  collapse_walkthrough: false
+  sequence_diagrams: false
+
   auto_review:
+    # ON. See the header note. This is the single highest-impact setting in
+    # the file and the one the fleet had wrong.
     enabled: true
+
+    # OFF: one pass on the finished diff, not a re-review on every push.
+    # This is the actual quota-control lever (Gospel Rule 3).
+    auto_incremental_review: false
+
+    # OFF: the fleet flow is "open as draft, flip to Ready immediately".
+    # Reviewing the draft AND the ready version burns two reviews on one diff.
+    # CodeRabbit's GitHub App reacts to the PR's own `ready_for_review` event
+    # directly (no trigger workflow exists or is needed - see header), so the
+    # review lands the moment the PR is genuinely ready. No coverage is lost.
     drafts: false
+
+    # NO ignore_title_keywords KEY. See header. Do not re-add it.
+
+    # NO ignore_usernames KEY. See header: CodeRabbit is the only reviewer
+    # that still runs on dependabot/renovate PRs. Do not re-add it.
+
+    # Both listed because the fleet is split across default branch names
+    # (audit: 9 master, 16 main, 1 other). ECC's default branch is "main",
+    # already covered here.
+    base_branches:
+      - "main"
+      - "master"
+
   path_instructions:
+    - path: "**"
+      instructions: >-
+        Flag any hardcoded credential, API key, token, or secret, including
+        in config files, test fixtures, and committed logs. Flag any change
+        that can cause unrecoverable data loss. Flag missing .gitignore
+        coverage for env/secret files (.env, .env.*, .dev.vars, *.pem, *.key).
+
+    - path: "**/migrations/**"
+      instructions: >-
+        Migrations must be ADDITIVE ONLY. Flag any DROP TABLE, DROP COLUMN,
+        or destructive ALTER. Prefer ALTER TABLE ADD COLUMN. This applies to
+        every D1/SQLite app in the fleet without exception.
+
     - path: ".github/workflows/**"
-      instructions: |
-        Treat workflow changes as security-sensitive. Flag unpinned third-party actions, broad write permissions, persisted checkout credentials in write-token jobs, pull_request_target misuse, and untrusted GitHub context interpolated into shell commands.
+      instructions: >-
+        Third-party actions must be pinned to a full commit SHA, never a
+        mutable tag. Workflows must declare a top-level `permissions: {}`
+        deny-all default and grant scopes at job level only. Flag any catch
+        block that swallows an API error without verifying the intended
+        effect actually occurred. Also flag persisted checkout credentials
+        in write-token jobs, `pull_request_target` misuse, and untrusted
+        GitHub context values interpolated directly into shell commands.
+
+    - path: "**/{auth,session}/**"
+      instructions: >-
+        Token and session verification code. Review at maximum scrutiny.
+        Flag any weakening of a check, any comparison that is not constant
+        time, and any path that can return success without verifying.
+
     - path: "{scripts,bin}/**"
       instructions: |
         Focus on command injection, unsafe subprocess usage, path traversal, SSRF, secret exposure, and missing tests for new CLI behavior.
+
     - path: "skills/**/scripts/**"
       instructions: |
         Review generated or imported scripts as untrusted-input tooling. Flag RCE, path traversal, network fetches without validation, and writes outside the expected workspace.
+
     - path: "{skills,commands,agents,rules}/**"
       instructions: |
         Focus on prompt-injection resilience, tool-permission scope, destructive action guards, and secret exfiltration risks.
+
     - path: "{SECURITY.md,docs/security/**}"
       instructions: |
         Check that official distribution surfaces, disclosure guidance, and supply-chain rules stay accurate and do not endorse unofficial packages.
 
+  path_filters:
+    - "!**/*.lock"
+    - "!**/pnpm-lock.yaml"
+    - "!**/package-lock.json"
+    - "!**/yarn.lock"
+    - "!**/uv.lock"
+    - "!**/node_modules/**"
+    - "!**/venv/**"
+    - "!**/.venv/**"
+    - "!**/__pycache__/**"
+    - "!**/*.pyc"
+    - "!**/dist/**"
+    - "!**/build/**"
+    - "!**/.next/**"
+    - "!**/.wrangler/**"
+    - "!**/frameworks/**"
+    - "!**/*.min.js"
+    - "!**/*.map"
+
+  finishing_touches:
+    docstrings:
+      enabled: false
+
 chat:
   auto_reply: true
+
+knowledge_base:
+  # Opt out of cross-repo learning: parts of the fleet are private and their
+  # contents must not inform reviews elsewhere.
+  opt_out: true
+
+# ==============================================================================
+# SCHEMA NOTE
+# ==============================================================================
+# Only well-documented CodeRabbit keys are used here. An UNRECOGNISED key can
+# fail schema validation, and CodeRabbit then falls back to platform defaults
+# for the WHOLE file, silently. That is how you end up believing you have an
+# assertive reviewer while actually running defaults.
+#
+# Deliberately omitted for that reason: `auto_pause_after_reviewed_commits`
+# (present in two existing fleet configs, not reliably documented, and made
+# redundant by auto_incremental_review: false).
+#
+# After landing this file in a repo, confirm on the next PR that CodeRabbit's
+# comment reflects THESE settings (en-AU, assertive, request-changes on real
+# findings). If it reads like stock CodeRabbit, the file did not parse.
+# ==============================================================================
