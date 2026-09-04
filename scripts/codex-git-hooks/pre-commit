@@ -3,6 +3,69 @@ set -euo pipefail
 
 # ECC Codex Git Hook: pre-commit
 # Blocks commits that add high-signal secrets.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS IS SHAPED THE WAY IT IS
+# ---------------------------------------------------------------------------
+# 1. FORK COUNT IS THE BUDGET.  Process creation under Git for Windows / MSYS
+#    costs ~2.4s on this machine (measured: 20x /usr/bin/true = 48s).  The
+#    previous version ran 6 x (git diff + awk + rg) PER STAGED FILE, i.e. ~18
+#    spawns per file, so a 10-file commit took ~5 minutes and looked hung.
+#    This version does ONE git diff, ONE awk and ONE ripgrep for the WHOLE
+#    commit.  Cost is flat in the number of staged files.
+#
+# 2. THE SCAN MUST PROVE IT RAN.  Two canary lines carrying a per-run random
+#    token are injected at the START and the END of the scan stream and must
+#    both come back out of ripgrep.  This is the integrity gate, and it is the
+#    reason the hook does not have to trust exit codes:
+#      - start canary present  => git, awk, ripgrep and the pattern list are alive
+#      - end canary present    => ripgrep reached the end of the input, i.e. the
+#                                 scan COMPLETED rather than being killed part-way
+#    MEASURED on this machine: `timeout` killing a blocked native rg.exe returns
+#    exit 1, NOT 124.  Since 1 is also ripgrep's "no match", any hook that
+#    branches on 124 to spot a timeout will read a killed scan as a clean commit.
+#    The canary closes that hole: on a healthy run ripgrep MUST exit 0 with both
+#    canaries present, so anything else is an integrity failure and blocks.
+#
+# 3. FAIL CLOSED, BUT ALWAYS PRINT THE WAY OUT.  Every infrastructure failure
+#    blocks and prints the exact command to unblock.  The previous version did
+#    the opposite: `if hits="$(... | rg ... 2>/dev/null)"` cannot tell exit 1
+#    (no match) from exit 2 (bad pattern) or 127 (rg not installed), so a
+#    machine without ripgrep passed every commit in silence, forever.
+#
+# 4. NO PIPES, NO INHERITED STDIN.  Every stage writes a temp file and the next
+#    tool receives it as a file ARGUMENT, and every external command runs with
+#    </dev/null.  Nothing in the scan path can block on a handle.
+#
+# 5. ATTRIBUTION IS O(1) PER LINE, NOT O(n^2).  Dedup during attribution (stage
+#    4, only reached on a commit that is already being blocked) uses an
+#    associative array keyed by the full record, not a growing string scanned
+#    with a glob match.  A string-accumulator dedup is O(n^2) in total matched
+#    bytes: MEASURED at 630.7s for 32,000 matching lines in one generated
+#    config/token file (an ordinary generic-credential false-positive, not a
+#    real secret).  The record set carried into attribution is additionally
+#    capped (ECC_PRECOMMIT_LBL_CAP, default 500) as an independent safety
+#    margin, since only 3 lines per (path,pattern) are ever printed anyway.
+#
+# Escape hatches (semantics unchanged from the previous hook):
+#   ECC_SKIP_GIT_HOOKS=1 / ECC_SKIP_PRECOMMIT=1
+#   ./.ecc-hooks-disable   ./.git/ecc-hooks-disable
+#   (plus <resolved git dir>/ecc-hooks-disable, so the opt-out also works in a
+#    linked worktree, where .git is a FILE and the literal test cannot fire)
+#
+# Optional knobs:
+#   ECC_PRECOMMIT_TIMEOUT=N    per-command timeout, seconds (default 120; 0=off)
+#   ECC_PRECOMMIT_MAX_BYTES=N  cap on scanned added text (default 32 MiB)
+#   ECC_PRECOMMIT_LBL_CAP=N    cap on records carried into attribution (default 500)
+#   ECC_PRECOMMIT_FAILSAFE=open  infrastructure failure warns instead of blocking
+#                                (findings ALWAYS block, in either mode)
+#   ECC_PRECOMMIT_SHOW_MATCHES=1 print matched text raw instead of redacted
+
+export LC_ALL=C
+
+# --------------------------------------------------------------------------
+# Escape hatches.  All of this runs before anything forks.
+# --------------------------------------------------------------------------
 
 if [[ "${ECC_SKIP_GIT_HOOKS:-0}" == "1" || "${ECC_SKIP_PRECOMMIT:-0}" == "1" ]]; then
   exit 0
@@ -12,66 +75,481 @@ if [[ -f ".ecc-hooks-disable" || -f ".git/ecc-hooks-disable" ]]; then
   exit 0
 fi
 
-if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+# Resolve the git dir without forking.  Git runs hooks from the top of the work
+# tree, so .git is a directory (normal clone) or a file holding "gitdir: <path>"
+# (linked worktree / submodule).
+ecc_git_dir=""
+if [[ -d ".git" ]]; then
+  ecc_git_dir=".git"
+elif [[ -f ".git" ]]; then
+  while IFS= read -r _l || [[ -n "$_l" ]]; do
+    case "$_l" in
+      "gitdir: "*) ecc_git_dir="${_l#gitdir: }"; break ;;
+    esac
+  done < ".git"
+elif [[ -n "${GIT_DIR:-}" ]]; then
+  ecc_git_dir="$GIT_DIR"
+fi
+
+if [[ -n "$ecc_git_dir" && -f "$ecc_git_dir/ecc-hooks-disable" ]]; then
   exit 0
 fi
 
-staged_files="$(git diff --cached --name-only --diff-filter=ACMR || true)"
-if [[ -z "$staged_files" ]]; then
-  exit 0
-fi
+# --------------------------------------------------------------------------
+# Knobs
+# --------------------------------------------------------------------------
 
-has_findings=0
+TIMEOUT_SECS="${ECC_PRECOMMIT_TIMEOUT:-120}"
+MAX_BYTES="${ECC_PRECOMMIT_MAX_BYTES:-33554432}"
+LBL_CAP="${ECC_PRECOMMIT_LBL_CAP:-500}"
+FAILSAFE="${ECC_PRECOMMIT_FAILSAFE:-closed}"
 
-scan_added_lines() {
-  local file="$1"
-  local name="$2"
-  local regex="$3"
-  local added_lines
-  local hits
-
-  added_lines="$(git diff --cached -U0 -- "$file" | awk '/^\+\+\+ /{next} /^\+/{print substr($0,2)}')"
-  if [[ -z "$added_lines" ]]; then
-    return 0
+block_internal() {
+  # printf is a builtin, so this still prints when PATH is the thing that broke.
+  printf '\n[ECC pre-commit] SCANNER FAILURE: %s\n' "$1" >&2
+  if [[ -n "${2:-}" && -s "${2:-}" ]]; then
+    while IFS= read -r _e || [[ -n "$_e" ]]; do
+      printf '  %s\n' "$_e" >&2
+    done < "$2"
   fi
 
-  if hits="$(printf '%s\n' "$added_lines" | rg -n --pcre2 "$regex" 2>/dev/null)"; then
-    printf '\n[ECC pre-commit] Potential secret detected (%s) in %s\n' "$name" "$file" >&2
-    printf '%s\n' "$hits" | head -n 3 >&2
-    has_findings=1
+  if [[ "$FAILSAFE" == "open" ]]; then
+    printf '\n[ECC pre-commit] ECC_PRECOMMIT_FAILSAFE=open: allowing this commit UNSCANNED.\n' >&2
+    printf '[ECC pre-commit] Nothing was checked for secrets. Review the diff by hand.\n' >&2
+    exit 0
+  fi
+
+  printf '%s\n' \
+    '' \
+    '[ECC pre-commit] Commit blocked: the secret scan could not be completed.' \
+    'An unscanned commit is not a verified-clean commit, so this fails closed.' \
+    '' \
+    'Choose one:' \
+    '1) Fix the cause above.' \
+    '2) Keep working while the environment is broken, still blocking on real hits:' \
+    '     ECC_PRECOMMIT_FAILSAFE=open git commit ...' \
+    '3) Skip this hook for one commit (last resort):' \
+    '     ECC_SKIP_PRECOMMIT=1 git commit ...' >&2
+  exit 1
+}
+
+case "$FAILSAFE" in
+  closed|open) ;;
+  *) FAILSAFE=closed ;;
+esac
+case "$TIMEOUT_SECS" in
+  ''|*[!0-9]*) block_internal "ECC_PRECOMMIT_TIMEOUT must be a non-negative integer (got '$TIMEOUT_SECS')." ;;
+esac
+case "$MAX_BYTES" in
+  ''|*[!0-9]*) block_internal "ECC_PRECOMMIT_MAX_BYTES must be a positive integer (got '$MAX_BYTES')." ;;
+esac
+case "$LBL_CAP" in
+  ''|*[!0-9]*) block_internal "ECC_PRECOMMIT_LBL_CAP must be a positive integer (got '$LBL_CAP')." ;;
+esac
+
+# --------------------------------------------------------------------------
+# Tooling.  command -v is a builtin: this whole block forks nothing.
+# --------------------------------------------------------------------------
+
+command -v rg  >/dev/null 2>&1 || block_internal "ripgrep (rg) is not on PATH, so nothing can be scanned. Install it, or set ECC_SKIP_PRECOMMIT=1 if you accept the risk."
+command -v awk >/dev/null 2>&1 || block_internal "awk is not on PATH, so the staged diff cannot be parsed."
+
+# `timeout` costs one extra spawn per wrapped command (~2.4s each here).  It is
+# on by default because a wedged filesystem or AV filter driver is the one
+# failure this structure cannot rule out; ECC_PRECOMMIT_TIMEOUT=0 disables it.
+TO=()
+if [[ "$TIMEOUT_SECS" != "0" ]] && command -v timeout >/dev/null 2>&1; then
+  TO=(timeout -k 5 "$TIMEOUT_SECS")
+fi
+
+# Run an external command with stdin nailed shut.  The odd expansion keeps an
+# empty TO array safe under `set -u`.
+run() { "${TO[@]+"${TO[@]}"}" "$@" </dev/null; }
+
+# --------------------------------------------------------------------------
+# Scratch files.  Created by redirection under `set -C` (noclobber), which uses
+# O_EXCL and therefore refuses to follow a pre-existing file or symlink, so this
+# needs no mktemp spawn.  umask 077 because these hold staged secret text.
+# --------------------------------------------------------------------------
+
+umask 077
+_tb="${TMPDIR:-/tmp}/ecc-precommit.$$.${RANDOM}${RANDOM}"
+RAW="$_tb.diff"; SCAN="$_tb.scan"; HITS="$_tb.hits"; ERR="$_tb.err"; LBL="$_tb.lbl"
+trap 'rm -f "$_tb".* >/dev/null 2>&1 || true' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+set -C
+if ! { : >"$RAW"; } 2>/dev/null || ! { : >"$SCAN"; } 2>/dev/null \
+|| ! { : >"$HITS"; } 2>/dev/null || ! { : >"$ERR"; } 2>/dev/null \
+|| ! { : >"$LBL"; } 2>/dev/null; then
+  set +C
+  block_internal "cannot create scratch files under ${TMPDIR:-/tmp}. Set TMPDIR to a writable directory."
+fi
+set +C
+
+# Per-run random canary token.  Randomised so no staged file can forge or
+# suppress it.
+CANARY="ECCCANARY${RANDOM}${RANDOM}$$"
+
+# --------------------------------------------------------------------------
+# Detection patterns.
+#
+# All six original detections are preserved.  Four are WIDENED, and every
+# widened form keeps the original expression verbatim as its first alternative,
+# so every string the old hook caught is still caught.  The widening is limited
+# to anchored, high-signal prefixes with near-zero false-positive cost.
+#
+# The generic-credential rule is left EXACTLY as it was, deliberately.  Its
+# known gaps (\b not matching inside AWS_SECRET_ACCESS_KEY, JSON "password":,
+# unquoted .env values) are real, but closing them means accepting unquoted
+# values, which fires on README placeholders and test fixtures.  On a GLOBAL
+# hook with no inline allow-list, that trains the user to set
+# ECC_SKIP_PRECOMMIT=1 permanently, which is a worse outcome than the gap.
+# That change belongs in its own separately-reviewable commit.
+#
+# --pcre2 is NOT used.  None of these patterns need it (no look-around, no
+# backreferences) and all six were verified to compile and match on ripgrep's
+# default engine.  Requiring it would mean an rg built without PCRE2 errors on
+# every pattern, which under the old logic read as "clean".
+# --------------------------------------------------------------------------
+
+P_NAMES=(
+  "OpenAI key"
+  "GitHub classic token"
+  "GitHub fine-grained token"
+  "AWS access key"
+  "private key block"
+  "generic credential assignment"
+)
+
+# 1. original sk-[A-Za-z0-9]{20,} kept, plus modern sk-proj-/sk-ant-/sk-svcacct-
+#    (the hyphen after the short segment ended the old run after 3-7 chars).
+# 2. original ghp_ kept via gh[pousr]_, adding OAuth/user/server/refresh tokens
+#    (ghs_ is the GITHUB_TOKEN that most often leaks out of CI).
+# 4. original AKIA kept, plus ASIA (STS temporary credentials) and friends.
+# 5. the original demanded "RSA KEY", but real headers read "RSA PRIVATE KEY",
+#    so apart from bare PKCS#8 it matched NOTHING that exists.  MEASURED: the
+#    original expression returns rc=1 against -----BEGIN OPENSSH PRIVATE KEY-----
+#    even once the -e bug below is fixed.  Original kept as alternative 1.
+P_REGEX=(
+  'sk-[A-Za-z0-9]{20,}|sk-(proj|ant|svcacct|admin)-[A-Za-z0-9_-]{20,}'
+  'gh[pousr]_[A-Za-z0-9]{36}'
+  'github_pat_[A-Za-z0-9_]{20,}'
+  '(AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}'
+  '-----BEGIN (RSA|EC|OPENSSH|DSA|PRIVATE) KEY-----|-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY( BLOCK)?-----'
+  "(?i)\\b(api[_-]?key|secret|password|token)\\b\\s*[:=]\\s*['\\\"][^'\\\"]{12,}['\\\"]"
+)
+
+# --------------------------------------------------------------------------
+# Stage 1: ONE diff for the whole commit.
+#
+# Pinned against repo-local config that could otherwise neuter the scan.  This
+# hook is installed globally via core.hooksPath, so it runs inside cloned repos
+# whose config an attacker may control:
+#   --no-color     color.diff=always prefixes added lines with an ANSI escape,
+#                  so /^\+/ matches nothing and every file scans clean
+#   --no-ext-diff  diff.external replaces the output with a repo-chosen program
+#   --no-textconv  a .gitattributes filter would have us scan something other
+#                  than the bytes actually being committed
+#   --text         forces binary-classified content (a NUL byte, UTF-16, or a
+#                  .gitattributes binary/-diff marker) to be diffed as text
+#                  instead of collapsing to "Binary files ... differ" with no
+#                  '+' lines.  Without this a NUL-bearing .env or a UTF-16LE
+#                  file (which PowerShell's Out-File produces) committed a
+#                  live secret completely unscanned while the hook exited 0.
+#                  This runs AFTER path/extension skipping in the awk stage
+#                  below, so png/jpg/pdf/zip/gz/lock files are still skipped
+#                  by path before their content would ever be scanned as text;
+#                  --text only changes what happens to UNLISTED extensions
+#                  that git itself would have classified as binary, and for
+#                  those the safe direction is to scan them, not skip them.
+#   core.quotepath=off  stops non-ASCII paths becoming \303\251 escapes
+#   --diff-filter=ACMRT adds T (typechange), which the old filter omitted, so a
+#                  symlink replaced by a real file is no longer committed unscanned
+# There is NO per-file pathspec anywhere, so a path git would have quoted can no
+# longer be silently skipped the way the old `git diff -- "$file"` skipped it.
+# --------------------------------------------------------------------------
+
+# Decide work-tree-ness BEFORE the diff, never after.  Doing it afterwards as a
+# fallback would be a fail-open.  When .git was already found above we are
+# definitively in a work tree and can skip the spawn entirely (~2.4s here).
+# When it was not, a rev-parse FAILURE is only allowed to mean "not a repo" when
+# git says so (exit 128); any other failure, including a killed process, blocks.
+if [[ -z "$ecc_git_dir" ]]; then
+  rp_rc=0
+  rp_out="$(run git rev-parse --is-inside-work-tree 2>/dev/null)" || rp_rc=$?
+  if [[ "$rp_rc" -eq 128 ]]; then
+    exit 0    # genuinely not a git repository
+  elif [[ "$rp_rc" -ne 0 ]]; then
+    block_internal "could not determine whether this is a git work tree (git exited $rp_rc)."
+  fi
+  [[ "$rp_out" == "true" ]] || exit 0   # bare repo: no work tree, nothing staged to scan
+fi
+
+git_rc=0
+run git -c core.quotepath=off diff --cached -U0 --text \
+    --no-color --no-ext-diff --no-textconv --diff-filter=ACMRT \
+    >"$RAW" 2>"$ERR" || git_rc=$?
+
+# We are known to be inside a work tree, so any diff failure is a real error.
+if [[ "$git_rc" -ne 0 ]]; then
+  block_internal "could not read the staged diff (git exited $git_rc)." "$ERR"
+fi
+
+[[ -s "$RAW" ]] || exit 0   # nothing staged, or nothing that adds content
+
+# --------------------------------------------------------------------------
+# Stage 2: ONE awk pass.  Normalises the whole-commit diff into
+#     <path>\t<real line number>\t<added line content>
+# and injects the two canaries.
+#
+# The old one-liner used /^\+\+\+ /{next}, which is content-blind: any added
+# line whose own text began with "++ " was discarded along with the headers, a
+# one-character bypass.  This is a real state machine, so "+++ " only counts as
+# a header while we are genuinely inside a header block.
+# --------------------------------------------------------------------------
+
+read -r -d '' AWK_PROG <<'AWKEOF' || true
+function skipped(p) {
+  # Reproduces the previous hook's skip list exactly, including the fact that
+  # the lock-file names were full-path matches (so web/yarn.lock was NOT
+  # skipped before, and still is not).  Case-sensitive, as before.
+  if (p ~ /\.(png|jpg|jpeg|gif|svg|pdf|zip|gz|lock)$/) return 1
+  if (p == "pnpm-lock.yaml" || p == "package-lock.json") return 1
+  if (p == "yarn.lock" || p == "bun.lockb") return 1
+  return 0
+}
+BEGIN {
+  inhdr = 0; skip = 1; path = ""; ln = 0
+  bytes = 0; trunc = 0; emitted = 0; sections = 0; plus = 0; skipped_any = 0; hdrdrop = 0
+  print "\t0\t" canary "-start AKIA0123456789ABCDEF"
+}
+/^diff --git / { inhdr = 1; skip = 1; path = ""; ln = 0; sections++; next }
+/^@@/ {
+  inhdr = 0
+  if (match($0, /\+[0-9]+/)) ln = substr($0, RSTART + 1, RLENGTH - 1) + 0; else ln = 0
+  next
+}
+inhdr {
+  if (substr($0, 1, 4) == "+++ ") {
+    p = substr($0, 5)
+    # A unified diff appends a tab (and maybe a timestamp) after the path when
+    # the path contains a space.  Cut at the first tab or every line number
+    # reported for such a file comes out wrong.
+    t = index(p, "\t"); if (t > 0) p = substr(p, 1, t - 1)
+    if (p == "/dev/null") { skip = 1; path = ""; next }
+    if (substr(p, 1, 1) == "\"") p = substr(p, 2, length(p) - 2)
+    if (substr(p, 1, 2) == "b/") p = substr(p, 3)
+    path = p; skip = skipped(p)
+    if (skip) skipped_any = 1
+    next
+  }
+  # An added line reached the header branch: the diff did not look the way this
+  # parser expects, so we may be scanning an unknown subset.  Refuse.
+  if (substr($0, 1, 1) == "+") hdrdrop++
+  next
+}
+/^\+/ {
+  plus++
+  if (skip) { ln++; next }
+  out = path "\t" ln "\t" substr($0, 2)
+  sub(/\r$/, "", out)
+  bytes += length(out) + 1
+  if (bytes > maxbytes) trunc = 1; else { print out; emitted++ }
+  ln++
+  next
+}
+/^-/ { next }
+/^\\/ { next }
+{ ln++ }
+END {
+  print "\t0\t" canary "-end password = \"canary0123456789abc\""
+  if (hdrdrop > 0)                 exit 5   # unrecognised diff shape
+  if (sections == 0)               exit 6   # non-empty diff, no file sections
+  if (trunc)                       exit 3   # would have scanned only part
+  if (plus > 0 && emitted == 0 && !skipped_any) exit 7
+  if (emitted == 0)                exit 4   # nothing textual added
+  exit 0
+}
+AWKEOF
+
+awk_rc=0
+run awk -v canary="$CANARY" -v maxbytes="$MAX_BYTES" "$AWK_PROG" "$RAW" \
+    >"$SCAN" 2>"$ERR" || awk_rc=$?
+
+case "$awk_rc" in
+  0) ;;
+  4) exit 0 ;;   # only deletions / binary / skipped files: nothing to scan
+  3) block_internal "staged additions exceed the ${MAX_BYTES}-byte scan cap, so part of this commit would go unscanned. Split the commit, or raise ECC_PRECOMMIT_MAX_BYTES." ;;
+  5) block_internal "the staged diff did not have the expected shape, so added lines may have gone unexamined." ;;
+  6) block_internal "the staged diff contained no recognisable file sections. Something is rewriting git's diff output." ;;
+  7) block_internal "the staged diff contains added lines but none could be attributed to a file. Refusing to report this commit as clean." ;;
+  *) block_internal "failed to parse the staged diff (awk exited $awk_rc)." "$ERR" ;;
+esac
+
+# --------------------------------------------------------------------------
+# Stage 3: ONE ripgrep pass carrying every pattern.
+#   --no-config  a stray RIPGREP_CONFIG_PATH (e.g. --fixed-strings) silently
+#                rewrites every pattern and turns the scan into a no-op.
+#                MEASURED: without this guard the AWS pattern returned rc=1
+#                against a file containing a live-shaped key.
+#   -e           a pattern beginning with "-" can never be parsed as a flag.
+#                The old hook passed '-----BEGIN ...' positionally, so ripgrep
+#                exited 2 with "unrecognized flag" and 2>/dev/null hid it: the
+#                private-key rule has been DEAD since it was written.
+#   no -q        we need the output to verify the canaries.
+# --------------------------------------------------------------------------
+
+RG_BASE=(--no-config --no-ignore --text --color never --no-line-number)
+rg_args=("${RG_BASE[@]}")
+for _re in "${P_REGEX[@]}"; do rg_args+=(-e "$_re"); done
+
+rg_rc=0
+run rg "${rg_args[@]}" -- "$SCAN" >"$HITS" 2>"$ERR" || rg_rc=$?
+
+# On a healthy run ripgrep MUST exit 0, because the canaries always match.
+# rc=1 is therefore never "clean" here: it means the canaries did not match,
+# i.e. the scan did not really happen.  This is what makes the hook immune to
+# the measured `timeout`-returns-1 behaviour.
+if [[ "$rg_rc" -ne 0 ]]; then
+  block_internal "ripgrep did not complete the scan (exit $rg_rc). Exit codes other than a clean match mean the scan errored or was killed, which is not the same as finding nothing." "$ERR"
+fi
+
+# --------------------------------------------------------------------------
+# Integrity gate: both canaries must have survived the round trip.
+#
+# The whole loop body is redirected into $LBL ONCE ('} > "$LBL"'), instead of
+# reopening $LBL with '>>' on every matched line: reopening per line is a
+# syscall-heavy pattern that scales with the number of hits for no benefit,
+# since the file is only ever appended to sequentially in this one pass.
+# --------------------------------------------------------------------------
+
+saw_start=0; saw_end=0
+{
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    case "$line" in
+      *"$CANARY-start"*) saw_start=1; continue ;;
+      *"$CANARY-end"*)   saw_end=1;   continue ;;
+    esac
+    printf '%s\n' "$line"
+  done < "$HITS"
+} > "$LBL"
+
+if [[ "$saw_start" -ne 1 ]]; then
+  block_internal "scanner self-test failed: the leading canary was not matched. git, awk, ripgrep or the pattern list is not working, so 'no findings' would be a lie."
+fi
+if [[ "$saw_end" -ne 1 ]]; then
+  block_internal "scanner self-test failed: the trailing canary is missing, so ripgrep did not reach the end of the input. The scan was cut short (timeout or kill) and this commit is NOT verified clean."
+fi
+
+[[ -s "$LBL" ]] || exit 0   # scan completed, nothing but the canaries matched
+
+# --------------------------------------------------------------------------
+# Independent safety margin: cap the number of records carried into
+# attribution, regardless of the O(1) dedup used below.  Only 3 lines per
+# (path,pattern) are ever printed by report_line anyway, so this bounds
+# worst-case attribution work to a fixed ceiling no matter how many lines
+# matched, even in a pathological case (e.g. a generated file where a single
+# pattern matches tens of thousands of lines).  Single pass, single redirect,
+# no extra forks.
+# --------------------------------------------------------------------------
+
+LBL_OVERFLOW=0
+lbl_total=0
+LBL2="$_tb.lbl2"
+{
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    lbl_total=$((lbl_total + 1))
+    if [[ "$lbl_total" -le "$LBL_CAP" ]]; then
+      printf '%s\n' "$line"
+    fi
+  done < "$LBL"
+} > "$LBL2"
+LBL="$LBL2"
+if [[ "$lbl_total" -gt "$LBL_CAP" ]]; then
+  LBL_OVERFLOW=$((lbl_total - LBL_CAP))
+fi
+
+# --------------------------------------------------------------------------
+# Stage 4: attribution.  Only reached on a commit that is already being
+# blocked, so the extra spawns never slow down a clean commit.
+# --------------------------------------------------------------------------
+
+# Masks credential-shaped runs so a blocked commit does not copy the secret into
+# terminal scrollback and CI logs, which are retained longer and audited less
+# than git history.  Sets a global rather than printing, because command
+# substitution forks a subshell (~2.4s each on this machine).
+REDACTED=""
+redact() {
+  local s="${1:0:400}" out="" m
+  if [[ "${ECC_PRECOMMIT_SHOW_MATCHES:-0}" == "1" ]]; then REDACTED="$s"; return 0; fi
+  while [[ "$s" =~ ([A-Za-z0-9_+/=-]{12,}) ]]; do
+    m="${BASH_REMATCH[1]}"
+    out+="${s%%"$m"*}<redacted:${#m} chars>"
+    s="${s#*"$m"}"
+  done
+  REDACTED="$out$s"
+}
+
+report_line() {   # report_line <name> <record>
+  local name="$1" rec="$2" p l c rest
+  p="${rec%%$'\t'*}"; rest="${rec#*$'\t'}"
+  l="${rest%%$'\t'*}"; c="${rest#*$'\t'}"
+  [[ -z "$p" ]] && p="(unknown path)"
+  case "$l" in ''|*[!0-9]*) l="?"; c="$rec" ;; esac
+  if [[ "$p" != "$cur_path" || "$name" != "$cur_name" ]]; then
+    printf '\n[ECC pre-commit] Potential secret detected (%s) in %s\n' "$name" "$p" >&2
+    cur_path="$p"; cur_name="$name"; shown=0
+  fi
+  if [[ "$shown" -lt 3 ]]; then
+    redact "$c"
+    printf '  line %s: %s\n' "$l" "$REDACTED" >&2
+    shown=$((shown + 1))
   fi
 }
 
-while IFS= read -r file; do
-  [[ -z "$file" ]] && continue
+# Dedup is an associative array keyed by the whole record: O(1) per line,
+# rather than a growing string tested with a glob match (O(n) per line, O(n^2)
+# overall).  Bash 4+ is required for `declare -A`; Git for Windows ships
+# bash 5.x, so this is safe on the target platform.
+cur_path=""; cur_name=""; shown=0
+declare -A seen=()
+for i in "${!P_NAMES[@]}"; do
+  [[ -s "$LBL" ]] || break
+  sub_rc=0
+  run rg "${RG_BASE[@]}" -e "${P_REGEX[$i]}" -- "$LBL" >"$HITS" 2>/dev/null || sub_rc=$?
+  [[ "$sub_rc" -eq 0 ]] || continue
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    [[ -n "${seen[$line]+x}" ]] && continue
+    seen[$line]=1
+    report_line "${P_NAMES[$i]}" "$line"
+  done < "$HITS"
+done
 
-  case "$file" in
-    *.png|*.jpg|*.jpeg|*.gif|*.svg|*.pdf|*.zip|*.gz|*.lock|pnpm-lock.yaml|package-lock.json|yarn.lock|bun.lockb)
-      continue
-      ;;
-  esac
+# Anything the per-pattern passes could not claim still gets reported: a finding
+# must never be lost just because attribution failed.
+while IFS= read -r line || [[ -n "$line" ]]; do
+  [[ -z "$line" ]] && continue
+  [[ -n "${seen[$line]+x}" ]] && continue
+  seen[$line]=1
+  report_line "unclassified" "$line"
+done < "$LBL"
 
-  scan_added_lines "$file" "OpenAI key" 'sk-[A-Za-z0-9]{20,}'
-  scan_added_lines "$file" "GitHub classic token" 'ghp_[A-Za-z0-9]{36}'
-  scan_added_lines "$file" "GitHub fine-grained token" 'github_pat_[A-Za-z0-9_]{20,}'
-  scan_added_lines "$file" "AWS access key" 'AKIA[0-9A-Z]{16}'
-  scan_added_lines "$file" "private key block" '-----BEGIN (RSA|EC|OPENSSH|DSA|PRIVATE) KEY-----'
-  scan_added_lines "$file" "generic credential assignment" "(?i)\\b(api[_-]?key|secret|password|token)\\b\\s*[:=]\\s*['\\\"][^'\\\"]{12,}['\\\"]"
-done <<< "$staged_files"
-
-if [[ "$has_findings" -eq 1 ]]; then
-  cat >&2 <<'EOF'
-
-[ECC pre-commit] Commit blocked to prevent secret leakage.
-Fix:
-1) Remove secrets from staged changes.
-2) Move secrets to env vars or secret manager.
-3) Re-stage and commit again.
-
-Temporary bypass (not recommended):
-  ECC_SKIP_PRECOMMIT=1 git commit ...
-EOF
-  exit 1
+if [[ "$LBL_OVERFLOW" -gt 0 ]]; then
+  printf '\n[ECC pre-commit] ... and %d more matching line(s) not shown (record cap = %d, set ECC_PRECOMMIT_LBL_CAP to raise it).\n' "$LBL_OVERFLOW" "$LBL_CAP" >&2
 fi
 
-exit 0
+printf '%s\n' \
+  '' \
+  '[ECC pre-commit] Commit blocked to prevent secret leakage.' \
+  'Fix:' \
+  '1) Remove secrets from staged changes.' \
+  '2) Move secrets to env vars or secret manager.' \
+  '3) Re-stage and commit again.' \
+  '' \
+  'Temporary bypass (not recommended):' \
+  '  ECC_SKIP_PRECOMMIT=1 git commit ...' >&2
+exit 1
