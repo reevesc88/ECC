@@ -1,0 +1,230 @@
+# ==============================================================================
+# CANONICAL FLEET WORKFLOW - Claude @mention responder
+# Install at: .github/workflows/claude-mention.yml
+# ==============================================================================
+# ASCII only: fleet repos run unicode-safety lints on workflow files.
+#
+# Companion to claude-review.yml. That file runs automatically on every PR
+# and reviews the diff; this one answers when someone types "@claude" in a
+# PR/issue comment, review, or review comment, and can act on the request
+# (the action's own tools include repo write access - see permissions below).
+#
+# IMPORTANT - `pull_request` vs `issue_comment` resolve workflows differently:
+# `pull_request` runs the copy of the workflow FROM THE PR BRANCH (the merge
+# ref), so claude-review.yml can review its own PR. `issue_comment`,
+# `pull_request_review_comment` and `pull_request_review` ALWAYS run the copy
+# on the DEFAULT BRANCH, regardless of what any PR branch contains. This file
+# does nothing at all until it is merged to master - an @claude mention on a
+# PR that only adds this file will get the GitHub App's eyes reaction (the App
+# reacts to the mention independently of any workflow) and then silence,
+# because no workflow on master is listening yet. That is expected, not a
+# bug: `issue_comment`/`pull_request_review_comment`/`pull_request_review`
+# always resolve against the default branch's copy of the workflow (see
+# above), so an @claude mention responder only starts working once this file
+# itself is merged. (Do not cite a specific section number of the
+# claude-review-action-setup skill here - its section numbering has drifted
+# out of sync between this repo's checked-in copy and the canonical one
+# before; state the fact inline instead.)
+#
+# Like claude-review.yml, this workflow sets CLAUDE_CODE_SUBPROCESS_ENV_SCRUB
+# (2026-09-05, corrected from the original design). The scrub stops a
+# prompt-injected instruction from exfiltrating the live auth token (and any
+# write-scoped GITHUB_TOKEN) via a Bash tool call inside the Claude
+# subprocess - a concern that is independent of how Claude's response gets
+# posted, and this workflow's default (Bash-capable) tool access plus
+# contents/pull-requests/issues write makes that exfiltration path a real
+# credential-theft risk, not just an unwanted file edit. The original header
+# here reasoned that wiring in the scrub "would fight the action's own reply
+# mechanism" - that conflated the scrub (subprocess Bash env) with the
+# separate built-in comment tool tag mode replies through, which does not go
+# through the scrubbed Bash environment at all. Enabling the scrub does not
+# reduce tag mode's ability to edit files, push, or reply.
+#
+# Every trigger is gated on the commenter/reviewer/issue-author being OWNER
+# or COLLABORATOR (author_association) so a drive-by commenter on a public
+# repo cannot spend the account's Claude budget by typing "@claude". MEMBER
+# was deliberately dropped from this list (2026-09-05): on a public repo,
+# MEMBER means "member of the org that owns the repo", not "has access to
+# this specific repository" - it would let any org member trigger a bot
+# holding contents/pull-requests/issues write here regardless of whether
+# they have any access to this repo at all.
+#
+# `contents: write` (plus pull-requests/issues write) stays because tag mode
+# is meant to act on requests - "@claude fix this" - which needs the action's
+# default tool access to edit files and push, not just read/comment. That is
+# a materially larger blast radius than the read-only claude-review.yml, and
+# it is accepted here, not accidental: gating who can *invoke* the bot
+# (author_association above) does not constrain what Claude *reads* once
+# invoked - the full issue/PR thread, which can include earlier comments
+# from untrusted third parties on a public repo. A trusted maintainer's
+# "@claude fix this" on a thread that also carries a hostile earlier comment
+# could have that comment's instructions actioned with this workflow's write
+# access. Mitigating that fully would mean stripping tag mode down to the
+# review workflow's read-only/no-Bash posture, which would break the point
+# of this workflow (acting on requests) - so the accepted control is the
+# author_association gate above, not a technical barrier against thread
+# content. Anyone invoking @claude on a thread with untrusted prior content
+# should treat that as equivalent to giving Claude repo write access to act
+# on that content.
+#
+# COLLABORATOR (in the author_association gate) covers anyone added as a
+# repo collaborator regardless of their permission level, including
+# Read/Triage-only collaborators - not just Write/Admin ones. That is
+# accepted here on the same basis as the OWNER/COLLABORATOR-only decision
+# above: it is narrower than the previous OWNER/MEMBER/COLLABORATOR gate,
+# and further tightening (e.g. checking actual permission level via the
+# repo permissions API) is not something a job-level `if:` expression can
+# do without an extra authenticated step. Revisit if a fleet repo is known
+# to hand out Read/Triage collaborator access broadly.
+# ==============================================================================
+
+name: Claude Mention Responder
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  issues:
+    types: [opened]
+
+# Deny-all default. The job below opts in to exactly what it needs.
+permissions: {}
+
+concurrency:
+  group: claude-mention-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  respond:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # Scrubs the Claude auth token from the Claude subprocess Bash
+    # environment. See claude-review.yml for the full rationale; the same
+    # exfiltration risk applies here regardless of how the response is
+    # posted, and this job keeps default (Bash-capable) tool access.
+    env:
+      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
+
+    # No `actions: read` here - unlike additional_permissions-enabled setups,
+    # this workflow does not pass `additional_permissions: actions: read` to
+    # the action, so it consumes no CI-status/log MCP tools that permission
+    # would unlock. Add both together if that capability is ever wanted.
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+
+    # `contains(...)` is a plain substring test with no word-boundary check
+    # (GitHub Actions expressions have no regex support), so an incidental
+    # "@claude" inside an email address, URL, or quoted text would also
+    # trigger this job. Flagged repeatedly across review rounds on this PR
+    # (CodeRabbit, Codex, and this workflow's own Claude review). Accepted
+    # as-is on the same basis as every other risk trade-off this file
+    # documents: the OWNER/COLLABORATOR author_association gate below is
+    # the actual control (only a trusted actor's content can trigger a
+    # run at all), and the worst case of a false-positive substring match
+    # is one wasted run gated behind that same check, not an unauthorized
+    # invocation. Revisit with a dedicated authenticated step if this
+    # becomes noisy in practice - a job-level `if:` cannot do word-boundary
+    # matching on its own.
+    if: >-
+      (
+        github.event_name == 'issue_comment' &&
+        contains(github.event.comment.body, '@claude') &&
+        contains(fromJSON('["OWNER","COLLABORATOR"]'), github.event.comment.author_association)
+      ) || (
+        github.event_name == 'pull_request_review_comment' &&
+        contains(github.event.comment.body, '@claude') &&
+        contains(fromJSON('["OWNER","COLLABORATOR"]'), github.event.comment.author_association)
+      ) || (
+        github.event_name == 'pull_request_review' &&
+        contains(github.event.review.body || '', '@claude') &&
+        contains(fromJSON('["OWNER","COLLABORATOR"]'), github.event.review.author_association)
+      ) || (
+        github.event_name == 'issues' &&
+        (contains(github.event.issue.body || '', '@claude') || contains(github.event.issue.title, '@claude')) &&
+        contains(fromJSON('["OWNER","COLLABORATOR"]'), github.event.issue.author_association)
+      )
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      # CLAUDE_CODE_SUBPROCESS_ENV_SCRUB requires bubblewrap on Linux
+      # runners; ubuntu-latest does not ship it. See claude-review.yml.
+      - name: Install bubblewrap (required by env scrub)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+
+      # Mirrors claude-review.yml's two-path auth: a repo secret if present,
+      # otherwise the Claude GitHub App's own OIDC exchange. Without this,
+      # a fleet repo with no CLAUDE_CODE_OAUTH_TOKEN secret would silently
+      # hit the action with an empty token on every @claude mention instead
+      # of authenticating via the App. See claude-review.yml's header for
+      # why a job-level `if:` cannot check `secrets` directly.
+      - name: Check for Claude OAuth token
+        id: check-secret
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+            echo "has-token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has-token=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Claude Mention Responder (subscription token)
+        id: claude_token
+        if: steps.check-secret.outputs.has-token == 'true'
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # claude_code_oauth_token only authenticates Anthropic-side billing;
+          # the action's GitHub-side auth (setupGitHubToken(), used for
+          # posting the reply and any file edit/push) is a separate concern
+          # and defaults to its own GitHub App OIDC exchange when no
+          # github_token is given. Passing the job's own token here decouples
+          # a fleet repo's subscription secret from whether the Claude GitHub
+          # App happens to be installed/authorized for that repo - this job's
+          # permissions block already grants contents/pull-requests/issues
+          # write, which is everything tag mode needs. Unlike
+          # claude-review.yml's subscription step, there is no OIDC
+          # self-edit-invalidation risk to preserve by omitting this: none of
+          # this workflow's triggers (issue_comment, pull_request_review*,
+          # issues) ever run the PR-branch copy of this file, only the
+          # default branch's - so it can never differ from itself the way a
+          # `pull_request`-triggered review of this file's own edits can.
+          github_token: ${{ github.token }}
+          # NOT setting use_commit_signing: true here (tried on this file
+          # and on claude-review.yml, reverted on both): it skips the
+          # action's configureGitAuth() entirely, which also breaks the
+          # action's own internal `git fetch origin master` used to restore
+          # trusted config files from the default branch - confirmed by a
+          # live failed run on claude-review.yml ("could not read Username
+          # for 'https://github.com'"). CodeRabbit's underlying concern
+          # (the GitHub token sitting in .git/config as plain text) does
+          # not gain a new mitigation here anyway: this job already grants
+          # Claude default Bash-capable tool access by design (see header),
+          # so `cat .git/config` was already trivially available before
+          # this finding and remains an accepted part of that design, not a
+          # new hole.
+
+      # Deliberately bare - no `with:` block, confirmed intentional (Claude
+      # review flagged the silence here as standing out against how
+      # thoroughly every other step in this PR is annotated). This is the
+      # GitHub App OIDC fallback: no subscription secret is configured, so
+      # this step relies entirely on the action's own tag-mode defaults
+      # (default prompt, default tool access, OIDC token exchange) with
+      # nothing to override. Mirrors the equally-bare sibling step in
+      # claude-review.yml before its subscription-token counterpart needed
+      # github_token / use_commit_signing overrides added.
+      - name: Claude Mention Responder (GitHub App OIDC)
+        id: claude_oidc
+        if: steps.check-secret.outputs.has-token != 'true'
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
