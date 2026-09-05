@@ -14,11 +14,12 @@
 # ref), so claude-review.yml can review its own PR. `issue_comment`,
 # `pull_request_review_comment` and `pull_request_review` ALWAYS run the copy
 # on the DEFAULT BRANCH, regardless of what any PR branch contains. This file
-# does nothing at all until it is merged to master - an @claude mention on a
-# PR that only adds this file will get the GitHub App's eyes reaction (the App
-# reacts to the mention independently of any workflow) and then silence,
-# because no workflow on master is listening yet. That is expected, not a
-# bug: `issue_comment`/`pull_request_review_comment`/`pull_request_review`
+# does nothing at all until it is merged to the default branch - an @claude
+# mention on a PR that only adds this file will get the GitHub App's eyes
+# reaction (the App reacts to the mention independently of any workflow) and
+# then silence, because no workflow on the default branch is listening yet.
+# That is expected, not a bug:
+# `issue_comment`/`pull_request_review_comment`/`pull_request_review`
 # always resolve against the default branch's copy of the workflow (see
 # above), so an @claude mention responder only starts working once this file
 # itself is merged. (Do not cite a specific section number of the
@@ -69,13 +70,53 @@
 #
 # COLLABORATOR (in the author_association gate) covers anyone added as a
 # repo collaborator regardless of their permission level, including
-# Read/Triage-only collaborators - not just Write/Admin ones. That is
-# accepted here on the same basis as the OWNER/COLLABORATOR-only decision
-# above: it is narrower than the previous OWNER/MEMBER/COLLABORATOR gate,
-# and further tightening (e.g. checking actual permission level via the
-# repo permissions API) is not something a job-level `if:` expression can
-# do without an extra authenticated step. Revisit if a fleet repo is known
-# to hand out Read/Triage collaborator access broadly.
+# Read/Triage-only collaborators - not just Write/Admin ones. That was
+# accepted for a while on the basis that further tightening (checking
+# actual permission level via the repo permissions API) is not something a
+# job-level `if:` expression can do without an extra authenticated step -
+# a job's own `if:` only sees the initial event context, not a live API
+# call. RESOLVED 2026-09-05 (hardening pass 2, finding 3): the "Check
+# triggering user's actual permission" step below IS that extra
+# authenticated step. It runs first, resolves the real triggering user for
+# whichever event fired, and checks their actual permission level via
+# `repos/{owner}/{repo}/collaborators/{login}/permission`, requiring
+# admin, maintain, or write before any downstream step (including
+# fork-check) runs. author_association (OWNER/COLLABORATOR, in the
+# job-level `if:` above) still gates which events are even worth an API
+# call for; the permission-check step is what actually proves write
+# access, closing the gap this paragraph used to describe as open.
+#
+# 2026-09-05 HARDENING: SAME-REPO GATE (finding 6, fleet rollout). This
+# workflow had no fork check at all: an OWNER/COLLABORATOR's "@claude"
+# authorizes the RUN, but says nothing about which PR's content Claude then
+# reads and can act on with this job's contents/pull-requests/issues write.
+# Mirrors claude-review.yml's fork policy:
+#   - `pull_request_review` and `pull_request_review_comment` events carry
+#     the full PR object in the event payload, so the job-level `if:` below
+#     checks `github.event.pull_request.head.repo.full_name ==
+#     github.repository` directly - a maintainer reviewing (or replying on)
+#     a fork PR does not trigger a run against that fork's content.
+#   - `issue_comment` does NOT carry the PR's head repo in its event payload
+#     (only a `pull_request.url` link, when the issue is a PR at all), so
+#     job-context alone cannot decide fork-ness. The "Check fork status for
+#     issue_comment on a PR" step below fetches the PR via `gh api` early
+#     (before any Claude step) and sets `is-fork`; both Claude steps are
+#     additionally gated on that output. An `issue_comment` on a plain issue
+#     (not a PR) skips this check entirely (its `if:` is false) and its
+#     output resolves to empty, which the `!= 'true'` gate on the Claude
+#     steps correctly treats as "not a fork" - ordinary issue mentions are
+#     unaffected.
+#   - `issues` events have no PR/fork concept at all and are unaffected.
+# A skipped-for-fork run posts nothing (no PR comment, no file edit) - same
+# posture as claude-review.yml's fork skip.
+#
+# CHECKOUT NOTE: the two Claude Mention Responder steps below have no
+# checkout `ref:` at all (and the checkout step above uses the default
+# ref). That is intentional, not an oversight: in tag mode the action
+# re-checks out the PR's own head branch itself (see
+# anthropics/claude-code-action, src/github/operations/branch.ts), so a
+# `ref:` on this workflow's own checkout step would only be overwritten by
+# the action's internal checkout anyway.
 # ==============================================================================
 
 name: Claude Mention Responder
@@ -139,10 +180,12 @@ jobs:
         contains(fromJSON('["OWNER","COLLABORATOR"]'), github.event.comment.author_association)
       ) || (
         github.event_name == 'pull_request_review_comment' &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
         contains(github.event.comment.body, '@claude') &&
         contains(fromJSON('["OWNER","COLLABORATOR"]'), github.event.comment.author_association)
       ) || (
         github.event_name == 'pull_request_review' &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
         contains(github.event.review.body || '', '@claude') &&
         contains(fromJSON('["OWNER","COLLABORATOR"]'), github.event.review.author_association)
       ) || (
@@ -152,7 +195,129 @@ jobs:
       )
 
     steps:
+      # HARDENING PASS 2 (2026-09-05, finding 3): the job-level `if:` above
+      # only checks OWNER/COLLABORATOR author_association, which the
+      # "COLLABORATOR" note in this file's own header already documents as
+      # NOT proof of actual write access - GitHub grants COLLABORATOR
+      # association to Read/Triage-only collaborators too, and this
+      # workflow hands out contents/pull-requests/issues WRITE to whoever
+      # can pass that gate. This step closes that gap: it resolves the
+      # actual triggering user for whichever event fired (comment author,
+      # review author, or issue author - the same identity each branch of
+      # the job-level `if:` above checks author_association against) and
+      # verifies their REAL permission level via the collaborators/
+      # permission API, independent of author_association. Runs FIRST, so
+      # an unauthorized trigger never reaches fork-check, checkout,
+      # bubblewrap, or any Claude step. FAIL CLOSED: an unresolvable login
+      # or any API error (secondary rate limit, deleted account, transient
+      # network issue) is treated as NOT authorized - never assume access
+      # on an inconclusive check, the same posture the fork-check step
+      # below takes on its own API call.
+      - name: Check triggering user's actual permission
+        id: permission-check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ACTOR_LOGIN: >-
+            ${{
+              github.event.comment.user.login ||
+              github.event.review.user.login ||
+              github.event.issue.user.login
+            }}
+        run: |
+          set -euo pipefail
+          if [ -z "$ACTOR_LOGIN" ]; then
+            echo "::notice::Could not resolve the triggering user's login from this event payload - failing closed (skip)."
+            echo "has-write=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          PERMISSION=$(gh api "repos/${REPO}/collaborators/${ACTOR_LOGIN}/permission" --jq '.permission' 2>/dev/null || echo "")
+          if [ -z "$PERMISSION" ]; then
+            echo "::notice::Could not confirm ${ACTOR_LOGIN}'s permission level on ${REPO} (API error, unresolvable login, or non-collaborator) - failing closed (skip)."
+            echo "has-write=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          case "$PERMISSION" in
+            admin|maintain|write)
+              echo "has-write=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::notice::${ACTOR_LOGIN} has '${PERMISSION}' permission on ${REPO} - below the write/maintain/admin bar this workflow requires. Skipping."
+              echo "has-write=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      # SECOND step, after the permission check above (hardening pass 2 put
+      # the permission check first; this step was originally "FIRST" per the
+      # finding below, which still applies relative to checkout/bubblewrap).
+      # Claude review's own inline finding on this PR, Low: this
+      # used to run AFTER checkout and the bubblewrap install, so a
+      # fork-comment skip still paid for both before being caught - not a
+      # security issue since checkout uses the default ref and fetches
+      # nothing untrusted, but wasted CI time). Gated by its own `if:` below
+      # (issue_comment on a PR only, per Copilot review wording nit on this
+      # PR - it is conditional, not unconditional; it is simply the first
+      # step to run when it does apply). issue_comment carries no head-repo
+      # info in its own event payload (only a pull_request.url link, and
+      # only when the issue is a PR at all), so fork-ness cannot be decided
+      # from job context the way it can for
+      # pull_request_review/pull_request_review_comment above (see the
+      # job-level `if:` gate). Fetch the PR live and compare its head repo
+      # against this one. Skipped entirely (`if:` false) for a plain issue
+      # comment or a non-issue_comment event - its output then resolves to
+      # empty, which the downstream `!= 'true'` gates correctly treat as
+      # "not a fork".
+      #
+      # FAIL-CLOSED ON API ERROR (2026-09-05, this PR's own review - two
+      # independent Low findings): `gh api` runs under `set -euo pipefail`
+      # with no fallback, so a transient failure (secondary rate limit,
+      # network blip, or the PR having just been deleted) used to fail this
+      # STEP outright, which - because every downstream step's `if:` is
+      # implicitly ANDed with success() - failed the whole JOB and answered
+      # a legitimate same-repo @claude mention with nothing but a red check
+      # and no explanation. `|| echo ""` below degrades a transient API
+      # failure to an empty HEAD_REPO instead, which the comparison below
+      # already treats as "not this repo" (fail closed: skip rather than
+      # risk misclassifying a fork PR as same-repo) - now WITHOUT also
+      # failing the job outright, so a real same-repo mention gets a graceful
+      # skip-and-retry-later posture instead of a confusing red check.
+      #
+      # STEP-LEVEL SKIP, NOT JOB-LEVEL (Low, this PR's own review):
+      # claude-review.yml's bot-edit skip deliberately uses a JOB-level
+      # `if:` so a no-op run reports SKIPPED, not a misleadingly green
+      # SUCCESS - the same reasoning technically applies here too (a fork
+      # mention that never invokes Claude still reports this job as
+      # SUCCESS, since every step that DID run succeeded). Not changed to
+      # match: unlike claude-review.yml's bot-edit condition (derivable
+      # entirely from static event-payload fields at job-`if:` evaluation
+      # time), THIS check's answer requires a live `gh api` call - a job's
+      # own `if:` has no access to step outputs or runtime API calls, only
+      # the initial event context, so there is no way to make this
+      # particular decision at the job level at all, not just a stylistic
+      # choice to skip it. It also matters less here than in
+      # claude-review.yml: this workflow's SUCCESS/SKIPPED status is not
+      # consumed as a fleet merge-policy or required-check signal the way
+      # claude-review.yml's is (see that file's own header and its
+      # "KNOWN LIMITATION" note on required-check semantics).
+      - name: Check fork status for issue_comment on a PR
+        id: fork-check
+        if: steps.permission-check.outputs.has-write == 'true' && github.event_name == 'issue_comment' && github.event.issue.pull_request != null
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          HEAD_REPO=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.repo.full_name // ""' 2>/dev/null || echo "")
+          if [ "$HEAD_REPO" != "$REPO" ]; then
+            echo "::notice::Skipping: PR #${PR_NUMBER} head repo (${HEAD_REPO:-unknown, deleted fork, or a transient API error}) is not confirmed as this repository. @claude mentions on fork PRs (or on an unconfirmed head repo) are not actioned (same-repo-only, fail-closed policy)."
+            echo "is-fork=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is-fork=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        if: steps.permission-check.outputs.has-write == 'true' && steps.fork-check.outputs.is-fork != 'true'
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -160,6 +325,7 @@ jobs:
       # CLAUDE_CODE_SUBPROCESS_ENV_SCRUB requires bubblewrap on Linux
       # runners; ubuntu-latest does not ship it. See claude-review.yml.
       - name: Install bubblewrap (required by env scrub)
+        if: steps.permission-check.outputs.has-write == 'true' && steps.fork-check.outputs.is-fork != 'true'
         run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
 
       # Mirrors claude-review.yml's two-path auth: a repo secret if present,
@@ -170,6 +336,7 @@ jobs:
       # why a job-level `if:` cannot check `secrets` directly.
       - name: Check for Claude OAuth token
         id: check-secret
+        if: steps.permission-check.outputs.has-write == 'true' && steps.fork-check.outputs.is-fork != 'true'
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
@@ -181,7 +348,7 @@ jobs:
 
       - name: Claude Mention Responder (subscription token)
         id: claude_token
-        if: steps.check-secret.outputs.has-token == 'true'
+        if: steps.permission-check.outputs.has-write == 'true' && steps.fork-check.outputs.is-fork != 'true' && steps.check-secret.outputs.has-token == 'true'
         uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -204,7 +371,7 @@ jobs:
           # NOT setting use_commit_signing: true here (tried on this file
           # and on claude-review.yml, reverted on both): it skips the
           # action's configureGitAuth() entirely, which also breaks the
-          # action's own internal `git fetch origin master` used to restore
+          # action's own internal `git fetch origin <default branch>` used to restore
           # trusted config files from the default branch - confirmed by a
           # live failed run on claude-review.yml ("could not read Username
           # for 'https://github.com'"). CodeRabbit's underlying concern
@@ -226,5 +393,5 @@ jobs:
       # github_token / use_commit_signing overrides added.
       - name: Claude Mention Responder (GitHub App OIDC)
         id: claude_oidc
-        if: steps.check-secret.outputs.has-token != 'true'
+        if: steps.permission-check.outputs.has-write == 'true' && steps.fork-check.outputs.is-fork != 'true' && steps.check-secret.outputs.has-token != 'true'
         uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
