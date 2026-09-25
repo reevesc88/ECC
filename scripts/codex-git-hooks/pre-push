@@ -186,14 +186,14 @@ run_checked() {
     "$@" </dev/null || rc=$?
   fi
   if [[ "$rc" -eq 124 ]]; then
-    fail "$desc timed out after ${timeout_secs}s (raise it with ECC_PREPUSH_TIMEOUT=<seconds>, or ECC_PREPUSH_AUDIT_TIMEOUT=<seconds> for the audit step, if this is a legitimately slow check)"
+    fail "$desc timed out after ${timeout_secs}s (raise it with ECC_PREPUSH_TIMEOUT=<seconds>, or ECC_PREPUSH_AUDIT_TIMEOUT=<seconds> for the audit step, if this is a legitimately slow check). WARNING: this hook just attempted to kill the whole process group, but on Windows a background/detached process it spawned (e.g. via 'cmd /c start', '&', or a forked worker) can reliably survive that and keep running as an orphan -- this is not a rare edge case, it reproduced consistently in testing. An orphan like that can go on holding a port, a file lock, or a database/lockfile long after this push has failed. Check for leftover node/python/etc. processes (Task Manager, or 'tasklist' / 'wmic process list') and end them manually before retrying."
   elif [[ "$rc" -eq 137 ]]; then
     # 137 (128+SIGKILL) is ambiguous, unlike 124: GNU `timeout` itself
     # documents that 137 can mean either this hook's own `timeout -k 10`
     # escalated to SIGKILL after the process ignored SIGTERM, OR that
     # something external (most commonly the OOM killer) sent SIGKILL on its
     # own, independent of this timeout. Don't assert "timed out" as fact.
-    fail "$desc timed out or killed (OOM) after up to ${timeout_secs}s (exit 137/SIGKILL is ambiguous -- it can be this hook's own timeout escalating past SIGTERM, or an external kill such as an OOM killer; if this is a legitimately slow check, raise it with ECC_PREPUSH_TIMEOUT=<seconds>, or ECC_PREPUSH_AUDIT_TIMEOUT=<seconds> for the audit step -- otherwise investigate memory usage)"
+    fail "$desc timed out or killed (OOM) after up to ${timeout_secs}s (exit 137/SIGKILL is ambiguous -- it can be this hook's own timeout escalating past SIGTERM, or an external kill such as an OOM killer; if this is a legitimately slow check, raise it with ECC_PREPUSH_TIMEOUT=<seconds>, or ECC_PREPUSH_AUDIT_TIMEOUT=<seconds> for the audit step -- otherwise investigate memory usage). WARNING: this hook just attempted to kill the whole process group, but on Windows a background/detached process it spawned (e.g. via 'cmd /c start', '&', or a forked worker) can reliably survive that and keep running as an orphan -- this is not a rare edge case, it reproduced consistently in testing. An orphan like that can go on holding a port, a file lock, or a database/lockfile long after this push has failed. Check for leftover node/python/etc. processes (Task Manager, or 'tasklist' / 'wmic process list') and end them manually before retrying."
   elif [[ "$rc" -ne 0 ]]; then
     fail "$desc failed"
   fi
