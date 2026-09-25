@@ -170,7 +170,19 @@ function resolveWindowsCmdShim(command, env) {
 }
 
 function runClaude(args, options = {}, dependencies = {}) {
-  const command = options.command || 'claude';
+  // ECC_TEST_CLAUDE_COMMAND is a test-only override (unset in all real
+  // usage, so this is a no-op in production): it lets a CLI-level test that
+  // spawns scripts/setup.js as a separate process point this function at an
+  // absolute fixture launcher path. That's needed because, unlike the
+  // dependencies.runClaude injection seam setupClaudePlugin()/
+  // migrateClaudePluginScope() already expose for in-process tests, a
+  // subprocess test has no way to inject a JS-level dependency across the
+  // process boundary. A bare command name here would otherwise be resolved
+  // by Windows' spawnSync against the real OS PATH regardless of any PATH
+  // override in this process's own env (see the sibling in-process fixes in
+  // tests/lib/claude-plugin-setup.test.js and
+  // tests/lib/claude-scope-migration.test.js for the same root cause).
+  const command = options.command || process.env.ECC_TEST_CLAUDE_COMMAND || 'claude';
   const spawn = dependencies.spawnSync || spawnSync;
   const timeoutMs = options.timeoutMs ?? PROVIDER_COMMAND_TIMEOUT_MS;
   const spawnOptions = {

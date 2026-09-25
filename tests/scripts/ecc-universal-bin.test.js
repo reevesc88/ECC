@@ -123,14 +123,22 @@ function getPackedFixture() {
     ['pack', '--json', '--ignore-scripts', '--pack-destination', directory]
   );
   const packOutput = JSON.parse(packResult.stdout);
-  const filename = packOutput[0]?.filename;
+  // npm's `pack --json` output shape changed across npm major versions:
+  // older npm (bundled with the repo's pinned Node 20.x) returns a
+  // top-level array (`[{ filename, files: [...] }]`), while newer npm
+  // (npm 11+) returns an object keyed by package name
+  // (`{ "pkg-name": { filename, files: [...] } }`). Object.values() on an
+  // array returns its own elements, so this reads correctly for a
+  // single-package repo under either shape.
+  const packedEntry = Object.values(packOutput)[0];
+  const filename = packedEntry?.filename;
   assert.ok(filename, 'npm pack should report the archive filename');
 
   packedFixture = {
     archivePath: path.join(directory, filename),
     directory,
     publishedPaths: new Set(
-      packOutput[0]?.files?.map(file => file.path) || []
+      packedEntry?.files?.map(file => file.path) || []
     ),
   };
   return packedFixture;

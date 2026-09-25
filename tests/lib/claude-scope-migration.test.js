@@ -9,6 +9,7 @@ const repoRoot = path.join(__dirname, '..', '..');
 const fakeClaudeScript = path.join(repoRoot, 'tests', 'fixtures', 'fake-claude-plugin.js');
 const {
   OFFICIAL_MARKETPLACE_URL,
+  runClaude,
 } = require('../../scripts/lib/claude-plugin-setup');
 const {
   migrateClaudePluginScope,
@@ -126,6 +127,25 @@ function migrationOptions(fixture, scope, overrides = {}) {
   };
 }
 
+// Windows spawnSync resolves a bare command name (e.g. "claude") against the
+// real process PATH, ignoring any PATH override applied via process.env or
+// spawn options -- so PATH-shadowing alone cannot redirect it to the fixture
+// launcher. Pointing `command` at the launcher's absolute path (extensionless,
+// matching how createFixture() names it) sidesteps PATH resolution entirely:
+// runClaude()'s existing Windows .cmd-shim logic appends '.cmd' and verifies
+// the file exists before invoking it, and on POSIX the absolute path is
+// executed directly. This mirrors the same fix applied to the sibling
+// tests/lib/claude-plugin-setup.test.js, reusing migrateClaudePluginScope()'s
+// existing dependencies.runClaude injection seam.
+function claudeDependencies(fixture) {
+  return {
+    runClaude: (args, options = {}) => runClaude(
+      args,
+      { ...options, command: path.join(fixture.binDir, 'claude') }
+    ),
+  };
+}
+
 function readCalls(fixture) {
   if (!fs.existsSync(fixture.callsPath)) return [];
   return fs.readFileSync(fixture.callsPath, 'utf8')
@@ -195,7 +215,7 @@ test('all six directed scope pairs migrate destination-first with exact verifica
         marketplaces: [marketplace(sourceScope)],
       }, fixture => {
         const result = migrateClaudePluginScope(
-          migrationOptions(fixture, destinationScope)
+          migrationOptions(fixture, destinationScope), claudeDependencies(fixture)
         );
         assert.deepStrictEqual(result, {
           action: 'migrated',
@@ -221,7 +241,7 @@ test('all six directed scope pairs migrate destination-first with exact verifica
 
 test('a missing marketplace is added at the destination before plugin installation', () => {
   withFixture({ plugins: [plugin('user')] }, fixture => {
-    migrateClaudePluginScope(migrationOptions(fixture, 'project'));
+    migrateClaudePluginScope(migrationOptions(fixture, 'project'), claudeDependencies(fixture));
     const calls = readCalls(fixture);
     const marketplaceAdd = [
       'plugin', 'marketplace', 'add',
@@ -243,7 +263,7 @@ test('an interrupted source-plus-destination state resumes cleanup without reins
     plugins: [plugin('user'), plugin('project', { version: '2.0.0' })],
     marketplaces: [marketplace('user')],
   }, fixture => {
-    const result = migrateClaudePluginScope(migrationOptions(fixture, 'project'));
+    const result = migrateClaudePluginScope(migrationOptions(fixture, 'project'), claudeDependencies(fixture));
     assert.strictEqual(result.action, 'resumed');
     assert.strictEqual(result.sourceScope, 'user');
     assert.strictEqual(result.scope, 'project');
@@ -267,7 +287,7 @@ test('resume verifies an enabled destination before removing the source', () => 
     marketplaces: [marketplace('user')],
   }, fixture => {
     const error = captureError(() => (
-      migrateClaudePluginScope(migrationOptions(fixture, 'project'))
+      migrateClaudePluginScope(migrationOptions(fixture, 'project'), claudeDependencies(fixture))
     ));
     assert.strictEqual(error.phase, 'destination-verification');
     assert.ok(!readCalls(fixture).some(argv => argv[1] === 'uninstall'));
@@ -281,7 +301,7 @@ test('resume verifies an enabled destination before removing the source', () => 
 test('destination-only state is idempotently already migrated, including same-scope input', () => {
   for (const scope of ['user', 'project', 'local']) {
     withFixture({ plugins: [plugin(scope)] }, fixture => {
-      const result = migrateClaudePluginScope(migrationOptions(fixture, scope));
+      const result = migrateClaudePluginScope(migrationOptions(fixture, scope), claudeDependencies(fixture));
       assert.strictEqual(result.action, 'already-migrated');
       assert.strictEqual(result.sourceScope, null);
       assert.strictEqual(result.scope, scope);
@@ -305,7 +325,7 @@ test('destination-only migration honors explicit hook preferences and reports dr
     }));
     const result = migrateClaudePluginScope(migrationOptions(fixture, 'local', {
       hooks: 'strict',
-    }));
+    }), claudeDependencies(fixture));
     assert.strictEqual(result.action, 'already-migrated');
     assert.strictEqual(result.preferencesUpdated, true);
     const settings = JSON.parse(fs.readFileSync(fixture.settingsPath, 'utf8'));
@@ -317,7 +337,7 @@ test('destination-only migration honors explicit hook preferences and reports dr
     const result = migrateClaudePluginScope(migrationOptions(fixture, 'local', {
       dryRun: true,
       hooks: 'off',
-    }));
+    }), claudeDependencies(fixture));
     assert.strictEqual(result.action, 'already-migrated');
     assert.strictEqual(result.dryRun, true);
     assert.strictEqual(result.preferencesUpdated, false);
@@ -333,7 +353,7 @@ test('destination-only migration honors explicit hook preferences and reports dr
 test('destination-only state must be enabled before it is considered migrated', () => {
   withFixture({ plugins: [plugin('project', { enabled: false })] }, fixture => {
     const error = captureError(() => (
-      migrateClaudePluginScope(migrationOptions(fixture, 'project'))
+      migrateClaudePluginScope(migrationOptions(fixture, 'project'), claudeDependencies(fixture))
     ));
     assert.strictEqual(error.code, 'DESTINATION_VERIFICATION_FAILED');
     assert.strictEqual(error.phase, 'destination-verification');
@@ -377,7 +397,7 @@ test('zero installs, ambiguous non-destination scopes, and invalid inventories f
   for (const { state, scope, code } of cases) {
     withFixture(state, fixture => {
       const error = captureError(() => (
-        migrateClaudePluginScope(migrationOptions(fixture, scope))
+        migrateClaudePluginScope(migrationOptions(fixture, scope), claudeDependencies(fixture))
       ));
       assert.strictEqual(error.code, code);
       assert.deepStrictEqual(mutationCalls(fixture), []);
@@ -418,7 +438,7 @@ test('marketplace collisions fail closed in migration dry-run and resume cleanup
   for (const { state, options } of cases) {
     withFixture(state, fixture => {
       const error = captureError(() => (
-        migrateClaudePluginScope(migrationOptions(fixture, 'project', options))
+        migrateClaudePluginScope(migrationOptions(fixture, 'project', options), claudeDependencies(fixture))
       ));
       assert.strictEqual(error.code, 'MARKETPLACE_COLLISION');
       assert.deepStrictEqual(mutationCalls(fixture), []);
@@ -470,7 +490,7 @@ test('destination marketplace, install, and verification failures never uninstal
   for (const { state } of cases) {
     withFixture(state, fixture => {
       captureError(() => (
-        migrateClaudePluginScope(migrationOptions(fixture, 'project'))
+        migrateClaudePluginScope(migrationOptions(fixture, 'project'), claudeDependencies(fixture))
       ));
       assert.ok(!readCalls(fixture).some(argv => argv[1] === 'uninstall'));
       assert.ok(readState(fixture).plugins.some(entry => entry.scope === 'user'));
@@ -489,7 +509,7 @@ test('a concurrent non-destination install aborts before source cleanup', () => 
     ],
   }, fixture => {
     const error = captureError(() => (
-      migrateClaudePluginScope(migrationOptions(fixture, 'project'))
+      migrateClaudePluginScope(migrationOptions(fixture, 'project'), claudeDependencies(fixture))
     ));
     assert.strictEqual(error.phase, 'concurrency-check');
     assert.deepStrictEqual([...error.observedScopes].sort(), ['local', 'project', 'user']);
@@ -509,7 +529,7 @@ test('source uninstall failure reports both scopes and exact forward recovery', 
     }],
   }, fixture => {
     const error = captureError(() => (
-      migrateClaudePluginScope(migrationOptions(fixture, 'project'))
+      migrateClaudePluginScope(migrationOptions(fixture, 'project'), claudeDependencies(fixture))
     ));
     assert.strictEqual(error.phase, 'source-uninstall');
     assert.deepStrictEqual([...error.observedScopes].sort(), ['project', 'user']);
@@ -537,7 +557,7 @@ test('final verification failure is structured and leaves a resumable destinatio
     ],
   }, fixture => {
     const error = captureError(() => (
-      migrateClaudePluginScope(migrationOptions(fixture, 'project'))
+      migrateClaudePluginScope(migrationOptions(fixture, 'project'), claudeDependencies(fixture))
     ));
     assert.strictEqual(error.phase, 'final-verification');
     assert.deepStrictEqual(error.observedScopes, []);
@@ -556,7 +576,7 @@ test('dry-run returns exact ordered actions and performs no mutation', () => {
     const before = fs.readFileSync(fixture.statePath, 'utf8');
     const result = migrateClaudePluginScope(migrationOptions(fixture, 'project', {
       dryRun: true,
-    }));
+    }), claudeDependencies(fixture));
     assert.strictEqual(result.action, 'would-migrate');
     assert.strictEqual(result.dryRun, true);
     assert.deepStrictEqual(result.plannedActions, [
@@ -577,7 +597,7 @@ test('dry-run returns exact ordered actions and performs no mutation', () => {
   }, fixture => {
     const result = migrateClaudePluginScope(migrationOptions(fixture, 'project', {
       dryRun: true,
-    }));
+    }), claudeDependencies(fixture));
     assert.strictEqual(result.action, 'would-resume');
     assert.strictEqual(result.sourceScope, 'user');
     assert.deepStrictEqual(result.plannedActions, [
@@ -610,7 +630,7 @@ test('migration preserves hook preferences unless --hooks is explicit', () => {
       },
     };
     fs.writeFileSync(fixture.settingsPath, `${JSON.stringify(original, null, 2)}\n`);
-    const result = migrateClaudePluginScope(migrationOptions(fixture, 'project'));
+    const result = migrateClaudePluginScope(migrationOptions(fixture, 'project'), claudeDependencies(fixture));
     assert.strictEqual(result.hooks, 'off');
     assert.deepStrictEqual(
       JSON.parse(fs.readFileSync(fixture.settingsPath, 'utf8')),
@@ -634,7 +654,7 @@ test('migration preserves hook preferences unless --hooks is explicit', () => {
         },
       },
     }));
-    migrateClaudePluginScope(migrationOptions(fixture, 'project', { hooks: 'strict' }));
+    migrateClaudePluginScope(migrationOptions(fixture, 'project', { hooks: 'strict' }), claudeDependencies(fixture));
     const settings = JSON.parse(fs.readFileSync(fixture.settingsPath, 'utf8'));
     assert.strictEqual(settings.theme, 'dark');
     assert.strictEqual(settings.pluginConfigs['ecc@ecc'].futureKey, true);

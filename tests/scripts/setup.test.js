@@ -56,6 +56,19 @@ function createFixture(state = {}) {
     callsPath,
   };
 }
+function claudeCommandEnv(fixture) {
+  // Windows spawnSync resolves a bare command name (e.g. "claude") against
+  // the real OS PATH, ignoring any PATH override applied via process.env or
+  // spawn options -- so PATH-shadowing alone cannot redirect scripts/setup.js's
+  // internal claude invocations to this fixture's launcher (verified: the
+  // same bug reproduces even when the spawned CLI process's own env.PATH is
+  // set correctly from birth). ECC_TEST_CLAUDE_COMMAND is the test-only
+  // override runClaude() consults for exactly this case; point it at the
+  // launcher's absolute, extensionless path so runClaude()'s existing
+  // Windows .cmd-shim resolution (append '.cmd', verify existence) finds it
+  // deterministically instead of relying on PATH search.
+  return { ECC_TEST_CLAUDE_COMMAND: path.join(fixture.binDir, 'claude') };
+}
 function runSetup(fixture, args) {
   return spawnSync(process.execPath, [setupScript, ...args], {
     cwd: fixture.projectRoot,
@@ -67,6 +80,7 @@ function runSetup(fixture, args) {
       PATH: `${fixture.binDir}${path.delimiter}${process.env.PATH || ''}`,
       ECC_TEST_CLAUDE_STATE: fixture.statePath,
       ECC_TEST_CLAUDE_CALLS: fixture.callsPath,
+      ...claudeCommandEnv(fixture),
     },
     encoding: 'utf8',
     timeout: 15000,
@@ -117,6 +131,7 @@ function runInteractiveEccSetup(fixture, options = {}) {
       PATH: `${fixture.binDir}${path.delimiter}${process.env.PATH || ''}`,
       ECC_TEST_CLAUDE_STATE: fixture.statePath,
       ECC_TEST_CLAUDE_CALLS: fixture.callsPath,
+      ...claudeCommandEnv(fixture),
     },
     encoding: 'utf8',
     timeout: 15000,
