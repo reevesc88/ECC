@@ -14,6 +14,26 @@ const repoRoot = path.join(__dirname, '..', '..');
 const hooksPath = path.join(repoRoot, 'hooks', 'hooks.json');
 const dispatcherPath = path.join(repoRoot, 'scripts', 'hooks', 'posttooluse-dispatcher.js');
 
+// These tests assert exact, hardcoded hook-selection lists, so they must
+// start from a clean hook-control baseline. Without this, a developer's own
+// ambient customization (e.g. a personal ECC_DISABLED_HOOKS set globally on
+// their machine) leaks in via the `...process.env` spread below and silently
+// drops hooks the assertions still expect to see -- not a logic bug in the
+// dispatcher, just an unsanitized fixture picking up real machine state.
+const HOOK_CONTROL_ENV_KEYS = [
+  'ECC_DISABLED_HOOKS',
+  'ECC_HOOK_PROFILE',
+  'ECC_HOOKS_ENABLED',
+  'CLAUDE_PLUGIN_OPTION_HOOK_PROFILE',
+  'CLAUDE_PLUGIN_OPTION_HOOKS_ENABLED',
+];
+
+function cleanHookEnv(overrides = {}) {
+  const env = { ...process.env };
+  for (const key of HOOK_CONTROL_ENV_KEYS) delete env[key];
+  return { ...env, CLAUDE_PLUGIN_ROOT: repoRoot, ECC_PLUGIN_ROOT: repoRoot, ...overrides };
+}
+
 function test(name, fn) {
   try {
     fn();
@@ -38,12 +58,7 @@ function runDispatcher(mode, toolName, env = {}) {
     cwd: repoRoot,
     input: raw,
     encoding: 'utf8',
-    env: {
-      ...process.env,
-      CLAUDE_PLUGIN_ROOT: repoRoot,
-      ECC_PLUGIN_ROOT: repoRoot,
-      ...env
-    },
+    env: cleanHookEnv(env),
     timeout: 10000
   });
 }
@@ -58,12 +73,7 @@ function runConfiguredCommand(entry, raw, env = {}) {
     cwd: repoRoot,
     input: raw,
     encoding: 'utf8',
-    env: {
-      ...process.env,
-      CLAUDE_PLUGIN_ROOT: repoRoot,
-      ECC_PLUGIN_ROOT: repoRoot,
-      ...env
-    },
+    env: cleanHookEnv(env),
     timeout: 10000
   });
 }

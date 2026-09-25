@@ -26,13 +26,21 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const repoRoot = path.resolve(__dirname, '..', '..');
+// Force forward slashes even though path.join emits backslashes on win32:
+// observe.sh runs `dirname "$0"` and then appends a literal `/../scripts/...`
+// to the result. Git-Bash/Cygwin's dirname understands a backslash path and
+// returns it unchanged, so a Windows-style path here produced a *hybrid*
+// `C:\...\hooks/../scripts/lib/homunculus-dir.sh` argument to `.` (source).
+// The shell can still resolve that mixed form, but doing so is measurably
+// slower and occasionally slow enough to blow the spawnSync timeout below --
+// a plain POSIX-style path avoids the hybrid form entirely.
 const observeShPath = path.join(
   repoRoot,
   'skills',
   'continuous-learning-v2',
   'hooks',
   'observe.sh'
-);
+).split(path.sep).join('/');
 
 let passed = 0;
 let failed = 0;
@@ -87,7 +95,14 @@ function runObserve(entrypoint) {
         ECC_SKIP_OBSERVE: '0',
         CLAUDE_PROJECT_DIR: home
       },
-      timeout: 5000,
+      // 5s was calibrated for Linux/macOS CI. observe.sh forks python3 several
+      // times plus sources detect-project.sh; on Windows (Git Bash/Cygwin)
+      // per-process spawn overhead alone measures 6s+ for a single invocation
+      // even on the fast-exit ECC_HOOK_PROFILE=minimal path, so every
+      // sub-test here timed out and reported spawnSync's status:null
+      // uniformly regardless of entrypoint. 20s keeps a genuine hang bounded
+      // while giving slower subprocess-spawn platforms enough headroom.
+      timeout: 20000,
       encoding: 'utf8'
     });
   } finally {

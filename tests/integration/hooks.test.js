@@ -678,12 +678,18 @@ async function runTests() {
     const hookCommand = getHookCommandById(hooks, 'PostToolUse', 'post:dispatcher:async');
     const testDir = createTestDir();
     try {
+      // post:dispatcher:async's Bash matcher chains into post:observe:continuous-learning,
+      // which shells out to observe.sh. On Windows, observe.sh alone measures 6s+ per
+      // invocation (repeated python3 forks plus sourcing detect-project.sh), so the
+      // default 10s runHookCommand budget is too tight on this class of machine even
+      // though nothing is actually hung. 30s keeps genuine hangs bounded while giving
+      // the real chain enough room to finish.
       const result = await runHookCommand(hookCommand, {
         hook_event_name: 'PostToolUse',
         tool_name: 'Bash',
         tool_input: { command: 'gh pr create --title "Test"' },
         tool_output: { output: 'Creating pull request...\nhttps://github.com/owner/repo/pull/123' }
-      }, { HOME: testDir, USERPROFILE: testDir });
+      }, { HOME: testDir, USERPROFILE: testDir }, 30000);
 
       assert.ok(
         result.stderr.includes('PR created') || result.stderr.includes('github.com'),
