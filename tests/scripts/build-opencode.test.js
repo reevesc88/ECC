@@ -54,7 +54,14 @@ function main() {
       assert.strictEqual(result.status, 0, result.error?.message || result.stderr)
 
       const packOutput = JSON.parse(result.stdout)
-      const packagedPaths = new Set(packOutput[0]?.files?.map((file) => file.path) ?? [])
+      // npm's `pack --json` output shape changed across npm major versions:
+      // older npm (bundled with the repo's pinned Node 20.x) returns a
+      // top-level array (`[{ files: [...] }]`), while newer npm (npm 11+)
+      // returns an object keyed by package name (`{ "pkg-name": { files: [...] } }`).
+      // Object.values() on an array returns its own elements, so this reads
+      // correctly for a single-package repo under either shape.
+      const packedEntry = Object.values(packOutput)[0]
+      const packagedPaths = new Set(packedEntry?.files?.map((file) => file.path) ?? [])
 
       assert.ok(
         packagedPaths.has(".opencode/dist/index.js"),

@@ -113,6 +113,25 @@ function setupOptions(fixture, overrides = {}) {
   };
 }
 
+// Windows spawnSync resolves a bare command name (e.g. "claude") against the
+// real process PATH, ignoring any PATH override applied via process.env or
+// spawn options -- so PATH-shadowing alone cannot redirect it to the fixture
+// launcher. Pointing `command` at the launcher's absolute path (extensionless,
+// matching how createFixture() names it) sidesteps PATH resolution entirely:
+// runClaude()'s existing Windows .cmd-shim logic appends '.cmd' and verifies
+// the file exists before invoking it, and on POSIX the absolute path is
+// executed directly. This reuses the runClaude() dependency-injection seam
+// that setupClaudePlugin() already exposes (see the "provider runner times
+// out" test above for the sibling spawnSync-injection pattern).
+function claudeDependencies(fixture) {
+  return {
+    runClaude: (args, options = {}) => runClaude(
+      args,
+      { ...options, command: path.join(fixture.binDir, 'claude') }
+    ),
+  };
+}
+
 function readCalls(fixture) {
   if (!fs.existsSync(fixture.callsPath)) return [];
   return fs.readFileSync(fixture.callsPath, 'utf8')
@@ -235,7 +254,7 @@ test('marketplace provenance is validated according to its source type', () => {
 test('fresh installs require an explicit scope and perform no mutation', () => {
   withFixture({}, fixture => {
     assertThrowsContaining(
-      () => setupClaudePlugin(setupOptions(fixture)),
+      () => setupClaudePlugin(setupOptions(fixture), claudeDependencies(fixture)),
       ['scope', 'user', 'project', 'local']
     );
     assert.deepStrictEqual(mutationCalls(readCalls(fixture)), []);
@@ -248,7 +267,7 @@ test('an existing single-scope install defaults to its detected scope', () => {
     plugins: [installedPlugin('project')],
     marketplaces: [officialMarketplace('project')],
   }, fixture => {
-    const result = setupClaudePlugin(setupOptions(fixture, { hooks: 'minimal' }));
+    const result = setupClaudePlugin(setupOptions(fixture, { hooks: 'minimal' }), claudeDependencies(fixture));
     assert.strictEqual(result.action, 'updated');
     assert.strictEqual(result.scope, 'project');
     assert.deepStrictEqual(readCalls(fixture), [
@@ -270,7 +289,7 @@ test('requesting another scope fails without the PR 2 move-scope operation', () 
     marketplaces: [officialMarketplace('user')],
   }, fixture => {
     assertThrowsContaining(
-      () => setupClaudePlugin(setupOptions(fixture, { scope: 'project' })),
+      () => setupClaudePlugin(setupOptions(fixture, { scope: 'project' }), claudeDependencies(fixture)),
       ['already installed', 'user', 'scope migration']
     );
     assert.deepStrictEqual(mutationCalls(readCalls(fixture)), []);
@@ -282,7 +301,7 @@ test('fresh install follows the exact inventory, marketplace, install, and verif
     const result = setupClaudePlugin(setupOptions(fixture, {
       scope: 'project',
       hooks: 'strict',
-    }));
+    }), claudeDependencies(fixture));
     assert.strictEqual(result.action, 'installed');
     assert.strictEqual(result.scope, 'project');
     assert.deepStrictEqual(readCalls(fixture), [
@@ -304,7 +323,7 @@ test('fresh install follows the exact inventory, marketplace, install, and verif
 test('fresh installs support all Claude scopes while hook preferences stay user-only', () => {
   for (const scope of ['user', 'project', 'local']) {
     withFixture({}, fixture => {
-      setupClaudePlugin(setupOptions(fixture, { scope, hooks: 'minimal' }));
+      setupClaudePlugin(setupOptions(fixture, { scope, hooks: 'minimal' }), claudeDependencies(fixture));
       const calls = readCalls(fixture);
       assert.ok(calls.some(argv => (
         argv[0] === 'plugin'
@@ -342,7 +361,7 @@ test('same-scope repeat setup updates ECC and changes durable user hook preferen
       },
     }, null, 2)}\n`);
 
-    setupClaudePlugin(setupOptions(fixture, { scope: 'local', hooks: 'off' }));
+    setupClaudePlugin(setupOptions(fixture, { scope: 'local', hooks: 'off' }), claudeDependencies(fixture));
     const settings = JSON.parse(fs.readFileSync(fixture.settingsPath, 'utf8'));
     assert.strictEqual(settings.theme, 'dark');
     assert.deepStrictEqual(settings.pluginConfigs['another@market'], { enabled: false });
@@ -370,7 +389,7 @@ test('repeat setup preserves the current hook preference when --hooks is omitted
       },
     }, null, 2)}\n`);
 
-    const result = setupClaudePlugin(setupOptions(fixture, { hooks: undefined }));
+    const result = setupClaudePlugin(setupOptions(fixture, { hooks: undefined }), claudeDependencies(fixture));
     const settings = JSON.parse(fs.readFileSync(fixture.settingsPath, 'utf8'));
     assert.strictEqual(result.hooks, 'off');
     assert.strictEqual(settings.pluginConfigs['ecc@ecc'].options.hooks_enabled, false);
@@ -383,7 +402,7 @@ test('malformed user settings fail preflight without provider mutation or corrup
     const malformed = '{"theme":';
     fs.writeFileSync(fixture.settingsPath, malformed);
     assertThrowsContaining(
-      () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' })),
+      () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' }), claudeDependencies(fixture)),
       ['settings', 'invalid']
     );
     assert.deepStrictEqual(mutationCalls(readCalls(fixture)), []);
@@ -400,7 +419,7 @@ test('legacy plugin inventory fails closed before marketplace or plugin mutation
     }],
   }, fixture => {
     assertThrowsContaining(
-      () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' })),
+      () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' }), claudeDependencies(fixture)),
       ['legacy', 'uninstall']
     );
     assert.deepStrictEqual(mutationCalls(readCalls(fixture)), []);
@@ -416,7 +435,7 @@ test('skills-directory ECC plugins fail closed before marketplace or plugin muta
     }],
   }, fixture => {
     assertThrowsContaining(
-      () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' })),
+      () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' }), claudeDependencies(fixture)),
       ['ecc@skills-dir', 'duplicate', 'uninstall']
     );
     assert.deepStrictEqual(mutationCalls(readCalls(fixture)), []);
@@ -435,7 +454,7 @@ test('manual plugin layouts fail closed before provider mutation', () => {
     fs.mkdirSync(path.dirname(manualManifest), { recursive: true });
     fs.writeFileSync(manualManifest, JSON.stringify({ name: 'ecc' }));
     assertThrowsContaining(
-      () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' })),
+      () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' }), claudeDependencies(fixture)),
       ['manual', 'ecc']
     );
     assert.deepStrictEqual(mutationCalls(readCalls(fixture)), []);
@@ -447,7 +466,7 @@ test('duplicate ECC plugin scopes fail closed before mutation', () => {
     plugins: [installedPlugin('user'), installedPlugin('project')],
   }, fixture => {
     assertThrowsContaining(
-      () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' })),
+      () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' }), claudeDependencies(fixture)),
       ['multiple', 'scope']
     );
     assert.deepStrictEqual(mutationCalls(readCalls(fixture)), []);
@@ -458,7 +477,7 @@ test('malformed plugin JSON and malformed plugin entries fail closed', () => {
   for (const pluginListResponses of [['{not-json'], [[{ id: 'ecc@ecc', enabled: true }]]]) {
     withFixture({ pluginListResponses }, fixture => {
       assertThrowsContaining(
-        () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' })),
+        () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' }), claudeDependencies(fixture)),
         ['plugin', 'inventory']
       );
       assert.deepStrictEqual(mutationCalls(readCalls(fixture)), []);
@@ -491,7 +510,7 @@ test('malformed marketplace JSON and marketplace name collisions fail closed', (
   for (const { initial, fragments } of cases) {
     withFixture(initial, fixture => {
       assertThrowsContaining(
-        () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' })),
+        () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' }), claudeDependencies(fixture)),
         fragments
       );
       assert.deepStrictEqual(mutationCalls(readCalls(fixture)), []);
@@ -503,14 +522,14 @@ test('managed rules-only state is allowed but overlapping managed content is rej
   withFixture({}, fixture => {
     writeManagedState(fixture, ['rules-core']);
     assert.strictEqual(
-      setupClaudePlugin(setupOptions(fixture, { scope: 'user' })).action,
+      setupClaudePlugin(setupOptions(fixture, { scope: 'user' }), claudeDependencies(fixture)).action,
       'installed'
     );
   });
   withFixture({}, fixture => {
     writeManagedState(fixture, ['rules-core', 'hooks-core']);
     assertThrowsContaining(
-      () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' })),
+      () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' }), claudeDependencies(fixture)),
       ['managed', 'overlap']
     );
     assert.deepStrictEqual(mutationCalls(readCalls(fixture)), []);
@@ -527,7 +546,7 @@ test('managed overlap detection resolves symlink aliases before classifying path
       destinationPath: path.join(aliasPath, 'hooks', 'hooks.json'),
     }]);
     assertThrowsContaining(
-      () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' })),
+      () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' }), claudeDependencies(fixture)),
       ['managed', 'overlap']
     );
     assert.deepStrictEqual(mutationCalls(readCalls(fixture)), []);
@@ -540,7 +559,7 @@ test('dry-run reads inventory only and never writes settings', () => {
       scope: 'local',
       hooks: 'strict',
       dryRun: true,
-    }));
+    }), claudeDependencies(fixture));
     assert.strictEqual(result.action, 'would-install');
     assert.strictEqual(result.dryRun, true);
     assert.deepStrictEqual(mutationCalls(readCalls(fixture)), []);
@@ -570,7 +589,7 @@ test('provider failures stop later operations and leave settings untouched', () 
   }, fixture => {
     fs.writeFileSync(fixture.settingsPath, '{"theme":"dark"}\n');
     assertThrowsContaining(
-      () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' })),
+      () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' }), claudeDependencies(fixture)),
       ['install exploded']
     );
     const calls = readCalls(fixture);
@@ -586,7 +605,7 @@ test('provider failures stop later operations and leave settings untouched', () 
     }],
   }, fixture => {
     assertThrowsContaining(
-      () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' })),
+      () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' }), claudeDependencies(fixture)),
       ['marketplace exploded']
     );
     const calls = readCalls(fixture);
@@ -608,7 +627,7 @@ test('post-install verification rejects absent, wrong-scope, disabled, and dupli
       pluginListResponses: [[], verification],
     }, fixture => {
       assertThrowsContaining(
-        () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' })),
+        () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' }), claudeDependencies(fixture)),
         ['verify', 'ecc@ecc']
       );
       assert.ok(!fs.existsSync(fixture.settingsPath));
@@ -621,7 +640,7 @@ test('marketplace verification failure prevents plugin installation', () => {
     marketplaceListResponses: [[], []],
   }, fixture => {
     assertThrowsContaining(
-      () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' })),
+      () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' }), claudeDependencies(fixture)),
       ['verify', 'marketplace']
     );
     assert.ok(!readCalls(fixture).some(argv => argv[1] === 'install'));
@@ -634,7 +653,7 @@ test('CLAUDE_CONFIG_DIR and paths containing spaces are honored', () => {
     const result = setupClaudePlugin(setupOptions(fixture, {
       scope: 'project',
       hooks: 'minimal',
-    }));
+    }), claudeDependencies(fixture));
     assert.strictEqual(path.resolve(result.settingsPath), path.resolve(fixture.settingsPath));
     assert.ok(result.settingsPath.includes(' '));
     assert.ok(fs.existsSync(fixture.settingsPath));
@@ -646,7 +665,7 @@ test('missing Claude executable reports an actionable recovery', () => {
     process.env.PATH = fixture.binDir;
     fs.rmSync(path.join(fixture.binDir, process.platform === 'win32' ? 'claude.cmd' : 'claude'));
     assertThrowsContaining(
-      () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' })),
+      () => setupClaudePlugin(setupOptions(fixture, { scope: 'user' }), claudeDependencies(fixture)),
       ['claude', 'install']
     );
     assert.ok(!fs.existsSync(fixture.settingsPath));

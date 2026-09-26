@@ -366,11 +366,21 @@ process.exit(7);
 
         // Keep PowerShell on PATH so it is resolved as the shell, then strip
         // bash candidates so the .sh fallback path hits the skip-warning branch.
+        // Only WindowsPowerShell\v1.0 is included (not bare System32): on a
+        // machine with WSL installed and a default distro registered,
+        // System32\bash.exe is a real, working WSL launcher stub that spawns
+        // and exits 0 for a no-op probe (`bash -c ':'`), so findBashBinary()
+        // reports it as usable -- the .sh fallback then really tries to run
+        // the fixture's Windows-path script through WSL bash, which can't
+        // resolve a C:\... path in its own filesystem namespace and exits
+        // 127, never reaching the skip-warning branch this test wants to
+        // exercise. PowerShell resolves fine from its own directory alone, so
+        // bare System32 was never required for that half of the fixture.
         const result = run(['shell', path.join('scripts', 'hook.sh')], {
           root,
           input: 'raw-input',
           env: { BASH: '', PATH: process.env.SystemRoot
-            ? `${process.env.SystemRoot}\\System32\\WindowsPowerShell\\v1.0;${process.env.SystemRoot}\\System32`
+            ? path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0')
             : '' },
         });
 
