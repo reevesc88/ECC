@@ -87,6 +87,37 @@ function withPathPrefix(environment, prefix) {
   return nextEnvironment;
 }
 
+function resolveTarCommand() {
+  if (process.platform !== 'win32') {
+    return 'tar';
+  }
+  // Git for Windows ships its own MSYS-linked GNU tar at
+  // <git>\usr\bin\tar.exe, and on many developer machines that directory
+  // precedes System32 on PATH, so a bare 'tar' resolves to it instead of
+  // Windows' own bsdtar. That MSYS build mis-parses Windows-style absolute
+  // paths passed as arguments -- confirmed empirically: it silently strips
+  // the backslash out of most "\<letter>" sequences (e.g.
+  // "C:\Users\calum\...\tartest\..." comes out as "C\:Userscalum...tartest...",
+  // with only one backslash surviving) -- which corrupts both the archive
+  // path and the -C destination path here and makes extraction fail with a
+  // spurious "Cannot open: No such file or directory" even though the
+  // destination genuinely exists. No tar flag fixes this, including
+  // --force-local (that flag only disables the unrelated "drive letter looks
+  // like a remote host" colon misdetection; the argument-mangling happens
+  // regardless of --force-local, and MSYS2_ARG_CONV_EXCL/MSYS_NO_PATHCONV do
+  // not stop it either). Windows 10 1803+ / Windows 11 (the CI baseline)
+  // ships a native, non-MSYS bsdtar at System32\tar.exe with no such quirk --
+  // it accepts ordinary Windows paths unmodified -- so prefer its absolute
+  // path when present, falling back to a bare 'tar' PATH lookup (preserving
+  // prior behavior) on any host where it's missing. POSIX is untouched.
+  const nativeTar = path.join(
+    process.env.SystemRoot || 'C:\\Windows',
+    'System32',
+    'tar.exe'
+  );
+  return fs.existsSync(nativeTar) ? nativeTar : 'tar';
+}
+
 function run(command, args, options = {}) {
   const invocation = getSpawnInvocation(command, args);
   const result = spawnSync(invocation.command, invocation.args, {
@@ -175,7 +206,7 @@ function prepareLocalPackedProject(packageManager) {
     });
   }
   fs.mkdirSync(modulesDirectory, { recursive: true });
-  run('tar', ['-xzf', fixture.archivePath, '-C', modulesDirectory], {
+  run(resolveTarCommand(), ['-xzf', fixture.archivePath, '-C', modulesDirectory], {
     cwd: projectDirectory,
   });
   fs.renameSync(extractedDirectory, packageDirectory);

@@ -57,6 +57,40 @@ function runProcess(args = [], options = {}) {
   });
 }
 
+function withHomeOverride(homeDir, fn) {
+  // findPluginInstall() (scripts/harness-audit.js) does not just take the
+  // first truthy home directory: it treats process.env.HOME,
+  // process.env.USERPROFILE, and os.homedir() as separate candidate roots
+  // and searches the real ~/.claude/plugins tree under every one of them
+  // that resolves. On Windows, os.homedir() itself reads USERPROFILE, not
+  // HOME, so overriding HOME alone leaves USERPROFILE (and therefore
+  // os.homedir()) pointing at the real user profile -- findPluginInstall()
+  // then also scans whatever ECC plugin install is genuinely present on the
+  // host machine alongside the fixture, and can return that real path
+  // instead of (or ahead of) the fixture's. This mirrors the HOME+
+  // USERPROFILE pairing buildEnv() already applies for the
+  // subprocess-spawning tests in this file; these in-process
+  // findPluginInstall() calls need the same pairing to be hermetic.
+  const originalHome = process.env.HOME;
+  const originalUserProfile = process.env.USERPROFILE;
+  process.env.HOME = homeDir;
+  process.env.USERPROFILE = homeDir;
+  try {
+    return fn();
+  } finally {
+    if (originalHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = originalHome;
+    }
+    if (originalUserProfile === undefined) {
+      delete process.env.USERPROFILE;
+    } else {
+      process.env.USERPROFILE = originalUserProfile;
+    }
+  }
+}
+
 function test(name, fn) {
   try {
     fn();
@@ -602,19 +636,11 @@ function runTests() {
         }, null, 2)
       );
 
-      const originalHome = process.env.HOME;
-      process.env.HOME = homeDir;
-      try {
+      withHomeOverride(homeDir, () => {
         const found = findPluginInstall(projectRoot);
         assert.ok(found);
         assert.ok(found.includes(`${path.sep}cache${path.sep}everything-claude-code${path.sep}ecc${path.sep}2.0.0${path.sep}`));
-      } finally {
-        if (originalHome === undefined) {
-          delete process.env.HOME;
-        } else {
-          process.env.HOME = originalHome;
-        }
-      }
+      });
     } finally {
       cleanup(homeDir);
       cleanup(projectRoot);
@@ -635,19 +661,11 @@ function runTests() {
         );
       }
 
-      const originalHome = process.env.HOME;
-      process.env.HOME = homeDir;
-      try {
+      withHomeOverride(homeDir, () => {
         const found = findPluginInstall(projectRoot);
         assert.ok(found);
         assert.ok(found.includes(`${path.sep}1.10.0${path.sep}`), `expected newest version, got ${found}`);
-      } finally {
-        if (originalHome === undefined) {
-          delete process.env.HOME;
-        } else {
-          process.env.HOME = originalHome;
-        }
-      }
+      });
     } finally {
       cleanup(homeDir);
       cleanup(projectRoot);
