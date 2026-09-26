@@ -19,6 +19,11 @@ function runTest(name, fn) {
   }
 }
 
+/**
+ * Checks the OpenCode build wiring: the package.json build and prepack
+ * scripts, that scripts/build-opencode.js writes .opencode/dist, and that
+ * `npm pack` ships the compiled payload. Exits 1 if any check fails.
+ */
 function main() {
   console.log("\n=== Testing build-opencode.js ===\n")
 
@@ -54,7 +59,11 @@ function main() {
       assert.strictEqual(result.status, 0, result.error?.message || result.stderr)
 
       const packOutput = JSON.parse(result.stdout)
-      const packagedPaths = new Set(packOutput[0]?.files?.map((file) => file.path) ?? [])
+      // `npm pack --json` prints an array in npm 10 (bundled with the pinned
+      // Node 20.x) and an object keyed by package name in npm 12.
+      // Object.values() returns the single package entry for either shape.
+      const packedEntry = Object.values(packOutput)[0]
+      const packagedPaths = new Set(packedEntry?.files?.map((file) => file.path) ?? [])
 
       assert.ok(
         packagedPaths.has(".opencode/dist/index.js"),

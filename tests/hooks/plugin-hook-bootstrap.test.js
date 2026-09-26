@@ -55,6 +55,10 @@ function test(name, fn) {
   }
 }
 
+/**
+ * Runs every scripts/hooks/plugin-hook-bootstrap.js test case in order,
+ * prints a summary, and exits 1 if any case fails.
+ */
 function runTests() {
   console.log('\n=== Testing plugin-hook-bootstrap.js ===\n');
 
@@ -366,11 +370,14 @@ process.exit(7);
 
         // Keep PowerShell on PATH so it is resolved as the shell, then strip
         // bash candidates so the .sh fallback path hits the skip-warning branch.
+        // Bare System32 is left out on purpose: with WSL installed,
+        // System32\bash.exe passes findBashBinary()'s probe, then fails on the
+        // fixture's Windows path (exit 127) before the skip-warning branch.
         const result = run(['shell', path.join('scripts', 'hook.sh')], {
           root,
           input: 'raw-input',
           env: { BASH: '', PATH: process.env.SystemRoot
-            ? `${process.env.SystemRoot}\\System32\\WindowsPowerShell\\v1.0;${process.env.SystemRoot}\\System32`
+            ? path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0')
             : '' },
         });
 

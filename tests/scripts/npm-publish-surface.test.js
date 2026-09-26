@@ -117,6 +117,11 @@ function buildExpectedPublishPaths(repoRoot) {
     .sort()
 }
 
+/**
+ * Checks that package.json `files` matches the module graph plus the explicit
+ * runtime allowlist, and that `npm pack` publishes exactly that reduced
+ * surface. Exits 1 if any check fails.
+ */
 function main() {
   console.log("\n=== Testing npm publish surface ===\n")
 
@@ -144,7 +149,11 @@ function main() {
       assert.strictEqual(result.status, 0, result.error?.message || result.stderr)
 
       const packOutput = JSON.parse(result.stdout)
-      const packagedPaths = new Set(packOutput[0]?.files?.map((file) => file.path) ?? [])
+      // `npm pack --json` prints an array in npm 10 (bundled with the pinned
+      // Node 20.x) and an object keyed by package name in npm 12.
+      // Object.values() returns the single package entry for either shape.
+      const packedEntry = Object.values(packOutput)[0]
+      const packagedPaths = new Set(packedEntry?.files?.map((file) => file.path) ?? [])
 
       for (const requiredPath of [
         "scripts/catalog.js",

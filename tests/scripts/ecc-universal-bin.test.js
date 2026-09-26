@@ -87,6 +87,31 @@ function withPathPrefix(environment, prefix) {
   return nextEnvironment;
 }
 
+/**
+ * Picks the tar executable used to unpack the packed npm archive.
+ *
+ * POSIX uses `tar` from PATH. On Windows a bare `tar` often resolves to Git
+ * for Windows' MSYS GNU tar (`<git>\usr\bin\tar.exe`), which strips
+ * backslashes from Windows path arguments and then fails with a spurious
+ * "Cannot open" error; `--force-local`, `MSYS2_ARG_CONV_EXCL` and
+ * `MSYS_NO_PATHCONV` do not prevent it. Windows 10 1803+ ships a native
+ * bsdtar at `%SystemRoot%\System32\tar.exe` that accepts Windows paths, so
+ * that absolute path is preferred when present, with a bare `tar` fallback.
+ *
+ * @returns {string} Absolute tar path on Windows when available, else `tar`.
+ */
+function resolveTarCommand() {
+  if (process.platform !== 'win32') {
+    return 'tar';
+  }
+  const nativeTar = path.join(
+    process.env.SystemRoot || 'C:\\Windows',
+    'System32',
+    'tar.exe'
+  );
+  return fs.existsSync(nativeTar) ? nativeTar : 'tar';
+}
+
 function run(command, args, options = {}) {
   const invocation = getSpawnInvocation(command, args);
   const result = spawnSync(invocation.command, invocation.args, {
@@ -112,6 +137,12 @@ function run(command, args, options = {}) {
   return result;
 }
 
+/**
+ * Packs this repository with `npm pack` once per run and caches the result.
+ *
+ * @returns {{ archivePath: string, directory: string, publishedPaths: Set<string> }}
+ *   The tarball path, its temp directory, and the paths npm reported packing.
+ */
 function getPackedFixture() {
   if (packedFixture) {
     return packedFixture;
@@ -123,19 +154,32 @@ function getPackedFixture() {
     ['pack', '--json', '--ignore-scripts', '--pack-destination', directory]
   );
   const packOutput = JSON.parse(packResult.stdout);
-  const filename = packOutput[0]?.filename;
+  // `npm pack --json` prints an array in npm 10 (bundled with the pinned Node
+  // 20.x) and an object keyed by package name in npm 12. Object.values()
+  // returns the single package entry for either shape.
+  const packedEntry = Object.values(packOutput)[0];
+  const filename = packedEntry?.filename;
   assert.ok(filename, 'npm pack should report the archive filename');
 
   packedFixture = {
     archivePath: path.join(directory, filename),
     directory,
     publishedPaths: new Set(
-      packOutput[0]?.files?.map(file => file.path) || []
+      packedEntry?.files?.map(file => file.path) || []
     ),
   };
   return packedFixture;
 }
 
+/**
+ * Unpacks the packed archive into a throwaway project's node_modules and
+ * writes the `ecc` and `ecc-universal` bin links (`.cmd` shims on Windows,
+ * symlinks elsewhere), as a package manager install would. Cached per run.
+ *
+ * @param {string} packageManager - Active package manager; `yarn` also gets
+ *   a local lockfile so `yarn exec` works in hardened mode.
+ * @returns {{ binDirectory: string, projectDirectory: string }} Project paths.
+ */
 function prepareLocalPackedProject(packageManager) {
   if (localPackedProject) {
     return localPackedProject;
@@ -167,7 +211,7 @@ function prepareLocalPackedProject(packageManager) {
     });
   }
   fs.mkdirSync(modulesDirectory, { recursive: true });
-  run('tar', ['-xzf', fixture.archivePath, '-C', modulesDirectory], {
+  run(resolveTarCommand(), ['-xzf', fixture.archivePath, '-C', modulesDirectory], {
     cwd: projectDirectory,
   });
   fs.renameSync(extractedDirectory, packageDirectory);
