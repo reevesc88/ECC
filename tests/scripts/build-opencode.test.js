@@ -19,6 +19,11 @@ function runTest(name, fn) {
   }
 }
 
+/**
+ * Checks the OpenCode build wiring: the package.json build and prepack
+ * scripts, that scripts/build-opencode.js writes .opencode/dist, and that
+ * `npm pack` ships the compiled payload. Exits 1 if any check fails.
+ */
 function main() {
   console.log("\n=== Testing build-opencode.js ===\n")
 
@@ -54,12 +59,9 @@ function main() {
       assert.strictEqual(result.status, 0, result.error?.message || result.stderr)
 
       const packOutput = JSON.parse(result.stdout)
-      // npm's `pack --json` output shape changed across npm major versions:
-      // older npm (bundled with the repo's pinned Node 20.x) returns a
-      // top-level array (`[{ files: [...] }]`), while newer npm (npm 11+)
-      // returns an object keyed by package name (`{ "pkg-name": { files: [...] } }`).
-      // Object.values() on an array returns its own elements, so this reads
-      // correctly for a single-package repo under either shape.
+      // `npm pack --json` prints an array in npm 10 (bundled with the pinned
+      // Node 20.x) and an object keyed by package name in npm 12.
+      // Object.values() returns the single package entry for either shape.
       const packedEntry = Object.values(packOutput)[0]
       const packagedPaths = new Set(packedEntry?.files?.map((file) => file.path) ?? [])
 

@@ -56,32 +56,68 @@ function createFixture(state = {}) {
     callsPath,
   };
 }
-function claudeCommandEnv(fixture) {
-  // Windows spawnSync resolves a bare command name (e.g. "claude") against
-  // the real OS PATH, ignoring any PATH override applied via process.env or
-  // spawn options -- so PATH-shadowing alone cannot redirect scripts/setup.js's
-  // internal claude invocations to this fixture's launcher (verified: the
-  // same bug reproduces even when the spawned CLI process's own env.PATH is
-  // set correctly from birth). ECC_TEST_CLAUDE_COMMAND is the test-only
-  // override runClaude() consults for exactly this case; point it at the
-  // launcher's absolute, extensionless path so runClaude()'s existing
-  // Windows .cmd-shim resolution (append '.cmd', verify existence) finds it
-  // deterministically instead of relying on PATH search.
-  return { ECC_TEST_CLAUDE_COMMAND: path.join(fixture.binDir, 'claude') };
+/**
+ * Returns the host PATH entries a setup CLI subprocess may inherit.
+ *
+ * On Windows this drops every directory that holds a real `claude.com` or
+ * `claude.exe`. The fixture launcher is `claude.cmd`, and Node's spawnSync
+ * only matches `.com`/`.exe` for the extensionless `claude` command, so PATH
+ * order alone cannot make the fixture win over an installed Claude Code.
+ * With those directories gone, the bare spawn fails with ENOENT and
+ * runClaude() falls back to its `where.exe claude.cmd` lookup, which finds
+ * the fixture launcher because its directory leads PATH. POSIX needs no
+ * filtering: the fixture's extensionless launcher wins by PATH order.
+ *
+ * @returns {string[]} PATH entries to place after the fixture bin directory.
+ */
+function hostPathWithoutRealClaude() {
+  const entries = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  if (process.platform !== 'win32') return entries;
+  return entries.filter(directory => (
+    !['claude.com', 'claude.exe'].some(name => fs.existsSync(path.join(directory, name)))
+  ));
 }
-function runSetup(fixture, args) {
+
+/**
+ * Builds the environment for a setup CLI subprocess: fixture home and Claude
+ * config directories, the fake Claude state files, and a PATH on which
+ * `claude` can only resolve to this fixture's launcher.
+ *
+ * Every case variant of PATH is removed first (Windows exposes it as `Path`)
+ * so the child sees exactly one PATH value.
+ *
+ * @param {object} fixture - Fixture from createFixture().
+ * @param {Object<string, string>} [extraEnv] - Variables to add last.
+ * @returns {Object<string, string>} Environment for spawnSync.
+ */
+function fixtureEnv(fixture, extraEnv = {}) {
+  const inherited = Object.fromEntries(
+    Object.entries(process.env).filter(([key]) => key.toUpperCase() !== 'PATH')
+  );
+  return {
+    ...inherited,
+    HOME: fixture.homeDir,
+    USERPROFILE: fixture.homeDir,
+    CLAUDE_CONFIG_DIR: fixture.configDir,
+    PATH: [fixture.binDir, ...hostPathWithoutRealClaude()].join(path.delimiter),
+    ECC_TEST_CLAUDE_STATE: fixture.statePath,
+    ECC_TEST_CLAUDE_CALLS: fixture.callsPath,
+    ...extraEnv,
+  };
+}
+
+/**
+ * Runs `node scripts/setup.js` non-interactively against a fixture.
+ *
+ * @param {object} fixture - Fixture from createFixture().
+ * @param {string[]} args - CLI arguments for setup.js.
+ * @param {Object<string, string>} [extraEnv] - Extra environment variables.
+ * @returns {import('child_process').SpawnSyncReturns<string>} Process result.
+ */
+function runSetup(fixture, args, extraEnv = {}) {
   return spawnSync(process.execPath, [setupScript, ...args], {
     cwd: fixture.projectRoot,
-    env: {
-      ...process.env,
-      HOME: fixture.homeDir,
-      USERPROFILE: fixture.homeDir,
-      CLAUDE_CONFIG_DIR: fixture.configDir,
-      PATH: `${fixture.binDir}${path.delimiter}${process.env.PATH || ''}`,
-      ECC_TEST_CLAUDE_STATE: fixture.statePath,
-      ECC_TEST_CLAUDE_CALLS: fixture.callsPath,
-      ...claudeCommandEnv(fixture),
-    },
+    env: fixtureEnv(fixture, extraEnv),
     encoding: 'utf8',
     timeout: 15000,
   });
@@ -89,6 +125,15 @@ function runSetup(fixture, args) {
 function quoteShellArgument(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
+/**
+ * Runs `ecc setup` under a pseudo-terminal and feeds it scripted answers, so
+ * the interactive wizard sees a real TTY. POSIX only; returns null on Windows.
+ *
+ * @param {object} fixture - Fixture from createFixture().
+ * @param {{ args?: string[], answers?: string[] }} [options] - Extra CLI
+ *   arguments (default `--dry-run`) and the answers typed at each prompt.
+ * @returns {import('child_process').SpawnSyncReturns<string>|null} Result.
+ */
 function runInteractiveEccSetup(fixture, options = {}) {
   if (process.platform === 'win32') {
     return null;
@@ -123,16 +168,7 @@ function runInteractiveEccSetup(fixture, options = {}) {
     `(${answerCommands}; sleep 0.1) | ${pseudoTerminalCommand}`,
   ], {
     cwd: fixture.projectRoot,
-    env: {
-      ...process.env,
-      HOME: fixture.homeDir,
-      USERPROFILE: fixture.homeDir,
-      CLAUDE_CONFIG_DIR: fixture.configDir,
-      PATH: `${fixture.binDir}${path.delimiter}${process.env.PATH || ''}`,
-      ECC_TEST_CLAUDE_STATE: fixture.statePath,
-      ECC_TEST_CLAUDE_CALLS: fixture.callsPath,
-      ...claudeCommandEnv(fixture),
-    },
+    env: fixtureEnv(fixture),
     encoding: 'utf8',
     timeout: 15000,
   });
@@ -279,6 +315,37 @@ test('dry-run JSON emits JSON only and reads inventory without mutation', () => 
     assert.strictEqual(payload.scope, 'local');
     assertNoSetupSpinner(`${result.stdout}${result.stderr}`);
     assert.strictEqual(hasMutation(fixture), false);
+  });
+});
+
+test('an inherited environment variable cannot choose the Claude executable', () => {
+  withFixture({}, fixture => {
+    // Regression guard: an earlier revision of this branch let an ambient
+    // ECC_TEST_CLAUDE_COMMAND redirect runClaude() to any executable.
+    const hijackDir = path.join(fixture.root, 'hijack');
+    const hijackCommand = path.join(hijackDir, 'not-claude');
+    const markerPath = path.join(fixture.root, 'hijacked.txt');
+    fs.mkdirSync(hijackDir, { recursive: true });
+    if (process.platform === 'win32') {
+      fs.writeFileSync(
+        `${hijackCommand}.cmd`,
+        `@echo off\r\necho hijacked> "${markerPath}"\r\nexit /b 1\r\n`
+      );
+    } else {
+      fs.writeFileSync(hijackCommand, `#!/bin/sh\necho hijacked > "${markerPath}"\nexit 1\n`);
+      fs.chmodSync(hijackCommand, 0o755);
+    }
+
+    const result = runSetup(fixture, [
+      '--mode', 'claude-plugin',
+      '--scope', 'local',
+      '--hooks', 'minimal',
+      '--dry-run',
+      '--json',
+    ], { ECC_TEST_CLAUDE_COMMAND: hijackCommand });
+    assert.strictEqual(result.status, 0, result.stderr);
+    assert.strictEqual(fs.existsSync(markerPath), false, 'setup ran the injected executable');
+    assert.ok(readCalls(fixture).length > 0, 'setup should have queried the fixture launcher');
   });
 });
 

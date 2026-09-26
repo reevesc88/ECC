@@ -113,16 +113,21 @@ function setupOptions(fixture, overrides = {}) {
   };
 }
 
-// Windows spawnSync resolves a bare command name (e.g. "claude") against the
-// real process PATH, ignoring any PATH override applied via process.env or
-// spawn options -- so PATH-shadowing alone cannot redirect it to the fixture
-// launcher. Pointing `command` at the launcher's absolute path (extensionless,
-// matching how createFixture() names it) sidesteps PATH resolution entirely:
-// runClaude()'s existing Windows .cmd-shim logic appends '.cmd' and verifies
-// the file exists before invoking it, and on POSIX the absolute path is
-// executed directly. This reuses the runClaude() dependency-injection seam
-// that setupClaudePlugin() already exposes (see the "provider runner times
-// out" test above for the sibling spawnSync-injection pattern).
+/**
+ * Builds setupClaudePlugin() dependencies that send every Claude CLI call to
+ * this fixture's fake launcher through runClaude()'s explicit
+ * `options.command` parameter.
+ *
+ * PATH shadowing alone is not enough on Windows: the fixture launcher is
+ * `claude.cmd`, and Node's spawnSync only matches `.com`/`.exe` for an
+ * extensionless command, so a real `claude.exe` later on PATH would run
+ * instead. An absolute, extensionless command path makes runClaude() fall
+ * back to `<command>.cmd` on Windows and execute the launcher directly on
+ * POSIX.
+ *
+ * @param {{ binDir: string }} fixture - Fixture from createFixture().
+ * @returns {{ runClaude: Function }} Dependencies for setupClaudePlugin().
+ */
 function claudeDependencies(fixture) {
   return {
     runClaude: (args, options = {}) => runClaude(
@@ -230,6 +235,28 @@ test('provider runner times out a hung Claude command with structured context', 
       return true;
     }
   );
+});
+
+test('provider runner takes its executable only from options.command, never the environment', () => {
+  const spawned = [];
+  const spawn = command => {
+    spawned.push(command);
+    return { status: 0, stdout: '[]', stderr: '' };
+  };
+  const previous = process.env.ECC_TEST_CLAUDE_COMMAND;
+  try {
+    process.env.ECC_TEST_CLAUDE_COMMAND = path.join(os.tmpdir(), 'not-claude');
+    runClaude(['plugin', 'list', '--json'], {}, { spawnSync: spawn });
+    runClaude(
+      ['plugin', 'list', '--json'],
+      { command: process.execPath },
+      { spawnSync: spawn }
+    );
+  } finally {
+    if (previous === undefined) delete process.env.ECC_TEST_CLAUDE_COMMAND;
+    else process.env.ECC_TEST_CLAUDE_COMMAND = previous;
+  }
+  assert.deepStrictEqual(spawned, ['claude', process.execPath]);
 });
 
 test('marketplace provenance is validated according to its source type', () => {

@@ -87,29 +87,23 @@ function withPathPrefix(environment, prefix) {
   return nextEnvironment;
 }
 
+/**
+ * Picks the tar executable used to unpack the packed npm archive.
+ *
+ * POSIX uses `tar` from PATH. On Windows a bare `tar` often resolves to Git
+ * for Windows' MSYS GNU tar (`<git>\usr\bin\tar.exe`), which strips
+ * backslashes from Windows path arguments and then fails with a spurious
+ * "Cannot open" error; `--force-local`, `MSYS2_ARG_CONV_EXCL` and
+ * `MSYS_NO_PATHCONV` do not prevent it. Windows 10 1803+ ships a native
+ * bsdtar at `%SystemRoot%\System32\tar.exe` that accepts Windows paths, so
+ * that absolute path is preferred when present, with a bare `tar` fallback.
+ *
+ * @returns {string} Absolute tar path on Windows when available, else `tar`.
+ */
 function resolveTarCommand() {
   if (process.platform !== 'win32') {
     return 'tar';
   }
-  // Git for Windows ships its own MSYS-linked GNU tar at
-  // <git>\usr\bin\tar.exe, and on many developer machines that directory
-  // precedes System32 on PATH, so a bare 'tar' resolves to it instead of
-  // Windows' own bsdtar. That MSYS build mis-parses Windows-style absolute
-  // paths passed as arguments -- confirmed empirically: it silently strips
-  // the backslash out of most "\<letter>" sequences (e.g.
-  // "C:\Users\calum\...\tartest\..." comes out as "C\:Userscalum...tartest...",
-  // with only one backslash surviving) -- which corrupts both the archive
-  // path and the -C destination path here and makes extraction fail with a
-  // spurious "Cannot open: No such file or directory" even though the
-  // destination genuinely exists. No tar flag fixes this, including
-  // --force-local (that flag only disables the unrelated "drive letter looks
-  // like a remote host" colon misdetection; the argument-mangling happens
-  // regardless of --force-local, and MSYS2_ARG_CONV_EXCL/MSYS_NO_PATHCONV do
-  // not stop it either). Windows 10 1803+ / Windows 11 (the CI baseline)
-  // ships a native, non-MSYS bsdtar at System32\tar.exe with no such quirk --
-  // it accepts ordinary Windows paths unmodified -- so prefer its absolute
-  // path when present, falling back to a bare 'tar' PATH lookup (preserving
-  // prior behavior) on any host where it's missing. POSIX is untouched.
   const nativeTar = path.join(
     process.env.SystemRoot || 'C:\\Windows',
     'System32',
@@ -143,6 +137,12 @@ function run(command, args, options = {}) {
   return result;
 }
 
+/**
+ * Packs this repository with `npm pack` once per run and caches the result.
+ *
+ * @returns {{ archivePath: string, directory: string, publishedPaths: Set<string> }}
+ *   The tarball path, its temp directory, and the paths npm reported packing.
+ */
 function getPackedFixture() {
   if (packedFixture) {
     return packedFixture;
@@ -154,13 +154,9 @@ function getPackedFixture() {
     ['pack', '--json', '--ignore-scripts', '--pack-destination', directory]
   );
   const packOutput = JSON.parse(packResult.stdout);
-  // npm's `pack --json` output shape changed across npm major versions:
-  // older npm (bundled with the repo's pinned Node 20.x) returns a
-  // top-level array (`[{ filename, files: [...] }]`), while newer npm
-  // (npm 11+) returns an object keyed by package name
-  // (`{ "pkg-name": { filename, files: [...] } }`). Object.values() on an
-  // array returns its own elements, so this reads correctly for a
-  // single-package repo under either shape.
+  // `npm pack --json` prints an array in npm 10 (bundled with the pinned Node
+  // 20.x) and an object keyed by package name in npm 12. Object.values()
+  // returns the single package entry for either shape.
   const packedEntry = Object.values(packOutput)[0];
   const filename = packedEntry?.filename;
   assert.ok(filename, 'npm pack should report the archive filename');
@@ -175,6 +171,15 @@ function getPackedFixture() {
   return packedFixture;
 }
 
+/**
+ * Unpacks the packed archive into a throwaway project's node_modules and
+ * writes the `ecc` and `ecc-universal` bin links (`.cmd` shims on Windows,
+ * symlinks elsewhere), as a package manager install would. Cached per run.
+ *
+ * @param {string} packageManager - Active package manager; `yarn` also gets
+ *   a local lockfile so `yarn exec` works in hardened mode.
+ * @returns {{ binDirectory: string, projectDirectory: string }} Project paths.
+ */
 function prepareLocalPackedProject(packageManager) {
   if (localPackedProject) {
     return localPackedProject;

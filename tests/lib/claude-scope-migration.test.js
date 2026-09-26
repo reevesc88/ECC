@@ -127,16 +127,16 @@ function migrationOptions(fixture, scope, overrides = {}) {
   };
 }
 
-// Windows spawnSync resolves a bare command name (e.g. "claude") against the
-// real process PATH, ignoring any PATH override applied via process.env or
-// spawn options -- so PATH-shadowing alone cannot redirect it to the fixture
-// launcher. Pointing `command` at the launcher's absolute path (extensionless,
-// matching how createFixture() names it) sidesteps PATH resolution entirely:
-// runClaude()'s existing Windows .cmd-shim logic appends '.cmd' and verifies
-// the file exists before invoking it, and on POSIX the absolute path is
-// executed directly. This mirrors the same fix applied to the sibling
-// tests/lib/claude-plugin-setup.test.js, reusing migrateClaudePluginScope()'s
-// existing dependencies.runClaude injection seam.
+/**
+ * Builds migrateClaudePluginScope() dependencies that send every Claude CLI
+ * call to this fixture's fake launcher through runClaude()'s explicit
+ * `options.command` parameter. See claudeDependencies() in
+ * tests/lib/claude-plugin-setup.test.js for why PATH shadowing alone does not
+ * reach the fixture launcher on Windows.
+ *
+ * @param {{ binDir: string }} fixture - Fixture from createFixture().
+ * @returns {{ runClaude: Function }} Dependencies for the migration call.
+ */
 function claudeDependencies(fixture) {
   return {
     runClaude: (args, options = {}) => runClaude(

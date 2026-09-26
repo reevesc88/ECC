@@ -57,20 +57,21 @@ function runProcess(args = [], options = {}) {
   });
 }
 
+/**
+ * Runs `fn` with HOME and USERPROFILE both pointed at `homeDir`, then
+ * restores (or deletes) the original values.
+ *
+ * findPluginInstall() searches every home candidate it can find: HOME,
+ * USERPROFILE and os.homedir(). On Windows os.homedir() reads USERPROFILE,
+ * so overriding HOME alone would also scan the real user profile and could
+ * return a real ECC plugin install instead of the fixture. This is the same
+ * pairing buildEnv() applies for the subprocess tests.
+ *
+ * @param {string} homeDir - Fixture home directory.
+ * @param {Function} fn - Callback to run with the override in place.
+ * @returns {*} The callback's return value.
+ */
 function withHomeOverride(homeDir, fn) {
-  // findPluginInstall() (scripts/harness-audit.js) does not just take the
-  // first truthy home directory: it treats process.env.HOME,
-  // process.env.USERPROFILE, and os.homedir() as separate candidate roots
-  // and searches the real ~/.claude/plugins tree under every one of them
-  // that resolves. On Windows, os.homedir() itself reads USERPROFILE, not
-  // HOME, so overriding HOME alone leaves USERPROFILE (and therefore
-  // os.homedir()) pointing at the real user profile -- findPluginInstall()
-  // then also scans whatever ECC plugin install is genuinely present on the
-  // host machine alongside the fixture, and can return that real path
-  // instead of (or ahead of) the fixture's. This mirrors the HOME+
-  // USERPROFILE pairing buildEnv() already applies for the
-  // subprocess-spawning tests in this file; these in-process
-  // findPluginInstall() calls need the same pairing to be hermetic.
   const originalHome = process.env.HOME;
   const originalUserProfile = process.env.USERPROFILE;
   process.env.HOME = homeDir;
@@ -103,6 +104,10 @@ function test(name, fn) {
   }
 }
 
+/**
+ * Runs every scripts/harness-audit.js test case in order, prints a summary,
+ * and exits 1 if any case fails.
+ */
 function runTests() {
   console.log('\n=== Testing harness-audit.js ===\n');
 
