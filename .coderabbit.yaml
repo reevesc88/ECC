@@ -42,9 +42,9 @@
 #
 # The keyword is also REDUNDANT. Draft status already signals "not ready", it
 # is structural rather than a string anyone can typo, and it is already
-# handled by `drafts: false` below. Quota is managed by `drafts: false` +
-# `auto_incremental_review: false` (one pass on the finished diff, per Gospel
-# Rule 3), not by a title string that turns a skip into a pass.
+# handled by `drafts: false` below. Every push is reviewed (`auto_incremental_review: true`),
+# per Calum's standing instruction, so draft status is the only skip,
+# never a title string that turns a skip into a pass.
 #
 # `ignore_usernames` carries NO dependabot/renovate entries, deliberately:
 # dependabot/renovate PRs run Actions with fork-like restrictions (no secrets,
@@ -103,9 +103,12 @@ reviews:
     # the file and the one the fleet had wrong.
     enabled: true
 
-    # OFF: one pass on the finished diff, not a re-review on every push.
-    # This is the actual quota-control lever (Gospel Rule 3).
-    auto_incremental_review: false
+    # ON: every push is reviewed. Calum's standing instruction (2026-09-30):
+    # nothing may hold up or stop automated PR reviews.
+    auto_incremental_review: true
+
+    # 0 disables auto-pause (CodeRabbit default is 5 reviewed commits).
+    auto_pause_after_reviewed_commits: 0
 
     # OFF: the fleet flow is "open as draft, flip to Ready immediately".
     # Reviewing the draft AND the ready version burns two reviews on one diff.
@@ -211,9 +214,8 @@ knowledge_base:
 # for the WHOLE file, silently. That is how you end up believing you have an
 # assertive reviewer while actually running defaults.
 #
-# Deliberately omitted for that reason: `auto_pause_after_reviewed_commits`
-# (present in two existing fleet configs, not reliably documented, and made
-# redundant by auto_incremental_review: false).
+# `auto_pause_after_reviewed_commits` is set to 0 (disabled) so CodeRabbit never
+# pauses reviews on a PR. It is a documented CodeRabbit schema key (default 5).
 #
 # After landing this file in a repo, confirm on the next PR that CodeRabbit's
 # comment reflects THESE settings (en-AU, assertive, request-changes on real
