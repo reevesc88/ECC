@@ -42,9 +42,10 @@
 #
 # The keyword is also REDUNDANT. Draft status already signals "not ready", it
 # is structural rather than a string anyone can typo, and it is already
-# handled by `drafts: false` below. Every push is reviewed (`auto_incremental_review: true`),
-# per Calum's standing instruction, so draft status is the only skip,
-# never a title string that turns a skip into a pass.
+# handled by `drafts: false` below. Each eligible push can trigger a review
+# (`auto_incremental_review: true`). `path_filters` can also skip a review when
+# all changed files are excluded, so draft status is not the only skip.
+# A skip is never driven by a title string that turns a skip into a pass.
 #
 # `ignore_usernames` carries NO dependabot/renovate entries, deliberately:
 # dependabot/renovate PRs run Actions with fork-like restrictions (no secrets,
